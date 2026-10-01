@@ -227,7 +227,7 @@ func serve(o options) error {
 	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
 	fmt.Fprintf(os.Stderr, "server started pid=%d\n", os.Getpid())
-	defer fmt.Fprintln(os.Stderr, "server stopped; temporary retention released")
+	defer fmt.Fprintln(os.Stderr, "server stopped")
 	for {
 		// The serial accept loop has no internal queue. Kernel-queued clients are
 		// accepted immediately; the idle clock runs only while waiting in Accept.
@@ -355,7 +355,7 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 	if readJSON(r, &ack) != nil || ack.Version != protocolVersion || ack.ID != id || !ack.Published {
 		return
 	}
-	if !req.history {
+	if !req.history && !s.o.noSlot {
 		if candidate.floor > s.progress.floor {
 			if err = s.feedback(candidate.floor); err != nil {
 				s.lost()

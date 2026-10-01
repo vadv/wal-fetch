@@ -239,8 +239,10 @@ func TestSizeAndLineage(t *testing.T) {
 
 // Exercise physical CopyData itself: server WAL end is not evidence of receipt.
 func TestPhysicalTransfer(t *testing.T) {
-	for _, mode := range []string{"complete", "gap", "short", "timeout"} {
+	for _, mode := range []string{"complete", "gap", "short", "timeout", "no-slot/complete", "no-slot/gap", "no-slot/short", "no-slot/timeout"} {
 		t.Run(mode, func(t *testing.T) {
+			noSlot := strings.HasPrefix(mode, "no-slot/")
+			mode = strings.TrimPrefix(mode, "no-slot/")
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -272,7 +274,11 @@ func TestPhysicalTransfer(t *testing.T) {
 					return
 				}
 				q, ok := m.(*pgproto3.Query)
-				if !ok || strings.TrimSpace(q.String) != "START_REPLICATION SLOT test_slot PHYSICAL 0/1000000 TIMELINE 1" {
+				want := "START_REPLICATION SLOT test_slot PHYSICAL 0/1000000 TIMELINE 1"
+				if noSlot {
+					want = "START_REPLICATION PHYSICAL 0/1000000 TIMELINE 1"
+				}
+				if !ok || strings.TrimSpace(q.String) != want {
 					done <- fmt.Errorf("bad start command")
 					return
 				}
@@ -328,7 +334,11 @@ func TestPhysicalTransfer(t *testing.T) {
 			defer c.Close(context.Background())
 			deadline, _ := ctx.Deadline()
 			_ = c.Conn().SetDeadline(deadline)
-			s := source{conn: c, slot: "test_slot"}
+			s := source{conn: c, slot: "test_slot", o: options{noSlot: noSlot}}
+			if noSlot {
+				s.slot = ""
+				s.acked = 123 // Slotless keepalive feedback must still be all zero.
+			}
 			var dst bytes.Buffer
 			err = s.receive(ctx, &dst, 1, 0x1000000, 0x1000004)
 			if (err == nil) != (mode == "complete") {

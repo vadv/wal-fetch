@@ -26,7 +26,7 @@ type options struct {
 	dir, identity string
 	size          uint64
 	timeout, idle time.Duration
-	serve         bool
+	serve, noSlot bool
 	args          []string
 }
 
@@ -49,12 +49,13 @@ func run(args []string) error {
 	fs.DurationVar(&o.timeout, "timeout", 30*time.Second, "total client operation timeout")
 	fs.DurationVar(&o.idle, "idle-timeout", 5*time.Minute, "server idle timeout")
 	fs.BoolVar(&o.serve, "serve", false, "run server in foreground")
+	fs.BoolVar(&o.noSlot, "no-slot", false, "fetch without a temporary slot or WAL retention")
 	help := fs.Bool("help", false, "show usage")
 	if fs.Parse(args) != nil {
 		return errors.New("invalid arguments; use -help")
 	}
 	if *help {
-		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
+		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
 		return nil
 	}
 	if o.timeout <= 0 || o.idle <= 0 || (!o.serve && fs.NArg() != 2) {
@@ -108,7 +109,7 @@ func run(args []string) error {
 	}
 	// A digest binds every request to the effective credentials/configuration;
 	// neither credentials nor a connection string are sent over the Unix socket.
-	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root}
+	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root, o.noSlot}
 	for _, key := range []string{"PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGCHANNELBINDING", "PGSERVICE", "PGSERVICEFILE"} {
 		value := os.Getenv(key)
 		identity = append(identity, key, value)

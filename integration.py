@@ -19,6 +19,7 @@ ROOT.mkdir(parents=True, exist_ok=True)
 if os.geteuid() == 0:
     raise SystemExit('Run integration.py as an unprivileged user, not root')
 SEGMENT_MB = int(os.environ.get('WAL_FETCH_TEST_SEGMENT_MB', '16'))
+NO_SLOT = os.environ.get('WAL_FETCH_TEST_NO_SLOT', '0') == '1'
 RUN = Path(tempfile.mkdtemp(prefix='unix-it-', dir=ROOT))
 SOCKETS = RUN / 's'
 SOCKETS.mkdir()
@@ -96,7 +97,7 @@ def lsn(value):
     return (int(hi, 16) << 32) + int(lo, 16)
 
 print(f'RUN={RUN}', flush=True)
-result = {'run': str(RUN), 'status': 'RUNNING'}
+result = {'run': str(RUN), 'status': 'RUNNING', 'no_slot': NO_SLOT}
 try:
     version = command(['initdb', '--version']).stdout.strip()
     if not re.search(r'PostgreSQL\) 16\.', version):
@@ -116,6 +117,7 @@ try:
         env = {k: v for k, v in env.items() if v is not None}
         limit = env.pop('WAL_FETCH_TIMEOUT', '30')
         args = [helper, '-pgdata', scope or c['scope'], '-idle-timeout', idle, '-timeout', limit + 's']
+        if NO_SLOT: args += ['-no-slot']
         if SEGMENT_MB != 16: args += ['-wal-segment-size', f'{SEGMENT_MB}MB']
         return command(args + [name, dest], check=check, timeout=timeout, env=env)
 
@@ -126,8 +128,8 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda i: fetch(source, closed, RUN / f'concurrent-{i}.wal'), range(8)))
     server_pid = int((source['scope'] / '.wal-fetch/server.pid').read_text())
-    assert sql(source, "SELECT count(*) FROM pg_replication_slots WHERE temporary") == '1'
-    result['concurrent_coldstart_one_server_one_slot'] = True
+    assert sql(source, 'SELECT count(*) FROM pg_replication_slots') == ('0' if NO_SLOT else '1')
+    result['concurrent_coldstart_one_server_expected_slots'] = True
     fetch(source, closed, completed)
     assert completed.read_bytes() == (source_dir / 'pg_wal' / closed).read_bytes()
     result['completed_exact_compare'] = True
@@ -169,13 +171,11 @@ try:
     mismatch = command([helper, '-pgdata', source['scope'], '-idle-timeout', '30s', '-wal-segment-size', '64MB' if SEGMENT_MB != 64 else '16MB', closed, unchanged], env=mismatch_env, check=False)
     assert mismatch.returncode and 'configuration mismatch' in mismatch.stdout
     result['different_segment_config_rejected'] = True
-
-    # Slot progress is measured on the real server, not inferred from logs.
-    def slot_state(scope):
-        log = (scope / '.wal-fetch/server.log').read_text()
-        name = re.findall(r'temporary slot created name=(wal_fetch_[0-9a-f]+)', log)[-1]
-        row = sql(source, f"SELECT active_pid, restart_lsn FROM pg_replication_slots WHERE slot_name='{name}'")
-        return name, row
+    mismatch = command([helper, '-pgdata', source['scope'], '-idle-timeout', '30s',
+                        '-wal-segment-size', f'{SEGMENT_MB}MB',
+                        '-no-slot=' + str(not NO_SLOT).lower(), closed, unchanged], env=mismatch_env, check=False)
+    assert mismatch.returncode and 'configuration mismatch' in mismatch.stdout
+    result['different_slot_mode_rejected'] = True
 
     def wait_for(predicate, seconds=5):
         deadline = time.monotonic() + seconds
@@ -184,93 +184,101 @@ try:
             time.sleep(0.03)
         raise AssertionError('condition did not become true')
 
-    sql(source, 'CHECKPOINT;')
-    active_name = sql(source, 'SELECT pg_walfile_name(pg_current_wal_flush_lsn())')
-    fetch(source, active_name, RUN / 'slot-active')
-    slot, row = slot_state(source['scope'])
-    owner, initial = row.split('|')
-    size = SEGMENT_MB << 20
-    first = lsn(initial) // size
-    for _ in range(4):
-        sql(source, 'INSERT INTO wal_fixture VALUES (42);')
-        sql(source, 'SELECT pg_switch_wal();')
-    def wal_name(seg):
-        pos = seg * size
-        return f'00000001{pos >> 32:08X}{(pos & 0xffffffff) // size:08X}'
-    floors = []
-    for seg in range(first, first + 4):
-        fetch(source, wal_name(seg), RUN / f'progress-{seg}.wal')
-        wait_for(lambda: lsn(slot_state(source['scope'])[1].split('|')[1]) >= max(lsn(initial), seg * size))
-        current_slot, row = slot_state(source['scope'])
-        current_owner, floor = row.split('|')
-        assert current_slot == slot and current_owner == owner, (current_slot, current_owner)
-        floors.append(lsn(floor))
-    assert floors == sorted(floors) and floors[-1] == (first + 3) * size, floors
-    fetch(source, wal_name(first), RUN / 'repeat-old')
-    assert lsn(slot_state(source['scope'])[1].split('|')[1]) == floors[-1]
-    fetch(source, '00000003.history', unchanged, check=False)
-    assert slot_state(source['scope'])[0] == slot and slot_state(source['scope'])[1]
-    result['same_owner_CopyDone_reuse_and_three_segment_advance'] = floors
-    result['old_repeat_and_missing_history_preserve_slot'] = True
+    if not NO_SLOT:
+        # Slot progress is measured on the real server, not inferred from logs.
+        def slot_state(scope):
+            log = (scope / '.wal-fetch/server.log').read_text()
+            name = re.findall(r'temporary slot created name=(wal_fetch_[0-9a-f]+)', log)[-1]
+            row = sql(source, f"SELECT active_pid, restart_lsn FROM pg_replication_slots WHERE slot_name='{name}'")
+            return name, row
 
-    before_rejection = slot_state(source['scope'])
-    for probe in [wal_name(first + 50), '00000002' + wal_name(first)[8:]]:
-        unchanged.write_bytes(b'ORIGINAL')
-        failed = fetch(source, probe, unchanged, check=False)
-        assert failed.returncode != 0 and unchanged.read_bytes() == b'ORIGINAL'
-        assert slot_state(source['scope']) == before_rejection, probe
-    result['future_and_nonancestor_requests_preserve_slot_owner_and_floor'] = True
-
-    # Local protocol negative cases on a real owner: no publication ACK, no advance.
-    # This canonical digest matches the documented effective connection identity
-    # in our controlled environment; it contains no credential in the wire request.
-    identity_values = ['127.0.0.1', source['port'], 'wal_reader', ENV['PGPASSWORD'],
-                       'replication', {'application_name':'wal-fetch-unix', 'replication':'yes'},
-                       size, '30s', str(source['scope'].resolve())]
-    for key in ('PGSSLMODE','PGSSLROOTCERT','PGSSLCERT','PGSSLKEY','PGSSLCRL','PGSSLSNI','PGCHANNELBINDING','PGSERVICE','PGSERVICEFILE'):
-        identity_values.extend((key, ENV.get(key, '')))
-    identity = hashlib.sha256(json.dumps(identity_values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    sql(source, 'INSERT INTO wal_fixture VALUES (43);')
-    candidate_name = wal_name(first + 4)
-    for mode in ('no-ack', 'wrong-id', 'wrong-version', 'not-published', 'injected-lsn', 'malformed'):
-        with socket.socket(socket.AF_UNIX) as conn:
-            conn.settimeout(5)
-            conn.connect(str(source['scope'] / '.wal-fetch/server.sock'))
-            req = {'version':1, 'identity':identity, 'name':candidate_name, 'deadline':time.time_ns()+5_000_000_000}
-            conn.sendall(json.dumps(req).encode()+b'\n')
-            stream = conn.makefile('rb')
-            header = json.loads(stream.readline())
-            assert header['ok'], header
-            payload = stream.read(header['length'])
-            assert len(payload) == size and stream.read(1) == b''
-            assert hashlib.sha256(payload).hexdigest() == header['sha256']
-            ack = {'version':1, 'id':header['id'], 'published':True}
-            if mode == 'wrong-id': ack['id'] = '0'*32
-            if mode == 'wrong-version': ack['version'] = 2
-            if mode == 'not-published': ack['published'] = False
-            if mode == 'injected-lsn': ack['lsn'] = 'FFFFFFFF/FFFFFFFF'
-            if mode != 'no-ack': conn.sendall(b'{broken}\n' if mode == 'malformed' else json.dumps(ack).encode()+b'\n')
-            stream.close()
-        fetch(source, '00000003.history', unchanged, check=False) # serial barrier
+        sql(source, 'CHECKPOINT;')
+        active_name = sql(source, 'SELECT pg_walfile_name(pg_current_wal_flush_lsn())')
+        fetch(source, active_name, RUN / 'slot-active')
+        slot, row = slot_state(source['scope'])
+        owner, initial = row.split('|')
+        size = SEGMENT_MB << 20
+        first = lsn(initial) // size
+        for _ in range(4):
+            sql(source, 'INSERT INTO wal_fixture VALUES (42);')
+            sql(source, 'SELECT pg_switch_wal();')
+        def wal_name(seg):
+            pos = seg * size
+            return f'00000001{pos >> 32:08X}{(pos & 0xffffffff) // size:08X}'
+        floors = []
+        for seg in range(first, first + 4):
+            fetch(source, wal_name(seg), RUN / f'progress-{seg}.wal')
+            wait_for(lambda: lsn(slot_state(source['scope'])[1].split('|')[1]) >= max(lsn(initial), seg * size))
+            current_slot, row = slot_state(source['scope'])
+            current_owner, floor = row.split('|')
+            assert current_slot == slot and current_owner == owner, (current_slot, current_owner)
+            floors.append(lsn(floor))
+        assert floors == sorted(floors) and floors[-1] == (first + 3) * size, floors
+        fetch(source, wal_name(first), RUN / 'repeat-old')
         assert lsn(slot_state(source['scope'])[1].split('|')[1]) == floors[-1]
-    fetch(source, candidate_name, RUN / 'valid-publication-after-invalid-acks')
-    wait_for(lambda: lsn(slot_state(source['scope'])[1].split('|')[1]) == (first + 4) * size)
-    result['invalid_or_missing_ACK_never_advances'] = True
+        fetch(source, '00000003.history', unchanged, check=False)
+        assert slot_state(source['scope'])[0] == slot and slot_state(source['scope'])[1]
+        result['same_owner_CopyDone_reuse_and_three_segment_advance'] = floors
+        result['old_repeat_and_missing_history_preserve_slot'] = True
+
+        before_rejection = slot_state(source['scope'])
+        for probe in [wal_name(first + 50), '00000002' + wal_name(first)[8:]]:
+            unchanged.write_bytes(b'ORIGINAL')
+            failed = fetch(source, probe, unchanged, check=False)
+            assert failed.returncode != 0 and unchanged.read_bytes() == b'ORIGINAL'
+            assert slot_state(source['scope']) == before_rejection, probe
+        result['future_and_nonancestor_requests_preserve_slot_owner_and_floor'] = True
+
+        # Local protocol negative cases on a real owner: no publication ACK, no advance.
+        # This canonical digest matches the documented effective connection identity
+        # in our controlled environment; it contains no credential in the wire request.
+        identity_values = ['127.0.0.1', source['port'], 'wal_reader', ENV['PGPASSWORD'],
+                           'replication', {'application_name':'wal-fetch-unix', 'replication':'yes'},
+                           size, '30s', str(source['scope'].resolve()), NO_SLOT]
+        for key in ('PGSSLMODE','PGSSLROOTCERT','PGSSLCERT','PGSSLKEY','PGSSLCRL','PGSSLSNI','PGCHANNELBINDING','PGSERVICE','PGSERVICEFILE'):
+            identity_values.extend((key, ENV.get(key, '')))
+        identity = hashlib.sha256(json.dumps(identity_values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        sql(source, 'INSERT INTO wal_fixture VALUES (43);')
+        candidate_name = wal_name(first + 4)
+        for mode in ('no-ack', 'wrong-id', 'wrong-version', 'not-published', 'injected-lsn', 'malformed'):
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.settimeout(5)
+                conn.connect(str(source['scope'] / '.wal-fetch/server.sock'))
+                req = {'version':1, 'identity':identity, 'name':candidate_name, 'deadline':time.time_ns()+5_000_000_000}
+                conn.sendall(json.dumps(req).encode()+b'\n')
+                stream = conn.makefile('rb')
+                header = json.loads(stream.readline())
+                assert header['ok'], header
+                payload = stream.read(header['length'])
+                assert len(payload) == size and stream.read(1) == b''
+                assert hashlib.sha256(payload).hexdigest() == header['sha256']
+                ack = {'version':1, 'id':header['id'], 'published':True}
+                if mode == 'wrong-id': ack['id'] = '0'*32
+                if mode == 'wrong-version': ack['version'] = 2
+                if mode == 'not-published': ack['published'] = False
+                if mode == 'injected-lsn': ack['lsn'] = 'FFFFFFFF/FFFFFFFF'
+                if mode != 'no-ack': conn.sendall(b'{broken}\n' if mode == 'malformed' else json.dumps(ack).encode()+b'\n')
+                stream.close()
+            fetch(source, '00000003.history', unchanged, check=False) # serial barrier
+            assert lsn(slot_state(source['scope'])[1].split('|')[1]) == floors[-1]
+        fetch(source, candidate_name, RUN / 'valid-publication-after-invalid-acks')
+        wait_for(lambda: lsn(slot_state(source['scope'])[1].split('|')[1]) == (first + 4) * size)
+        result['invalid_or_missing_ACK_never_advances'] = True
 
 
-    # An ERROR on the actual owning session deletes TEMPORARY; next call is fresh.
-    unchanged.write_bytes(b'ORIGINAL')
-    failed = fetch(source, '000000010000000000000000', unchanged, check=False)
-    assert failed.returncode and unchanged.read_bytes() == b'ORIGINAL'
-    wait_for(lambda: sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{slot}'") == '0')
-    fetch(source, closed, RUN / 'after-owner-error')
-    new_slot, row = slot_state(source['scope'])
-    assert new_slot != slot
-    sql(source, f"SELECT pg_terminate_backend({row.split('|')[0]})")
-    assert fetch(source, closed, unchanged, check=False).returncode != 0
-    fetch(source, closed, RUN / 'after-owner-disconnect')
-    assert 'retention lost' in (source['scope'] / '.wal-fetch/server.log').read_text()
-    result['owner_error_disconnect_and_honest_reconnect'] = True
+        # An ERROR on the actual owning session deletes TEMPORARY; next call is fresh.
+        unchanged.write_bytes(b'ORIGINAL')
+        failed = fetch(source, '000000010000000000000000', unchanged, check=False)
+        assert failed.returncode and unchanged.read_bytes() == b'ORIGINAL'
+        wait_for(lambda: sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{slot}'") == '0')
+        fetch(source, closed, RUN / 'after-owner-error')
+        new_slot, row = slot_state(source['scope'])
+        assert new_slot != slot
+        sql(source, f"SELECT pg_terminate_backend({row.split('|')[0]})")
+        assert fetch(source, closed, unchanged, check=False).returncode != 0
+        fetch(source, closed, RUN / 'after-owner-disconnect')
+        assert 'retention lost' in (source['scope'] / '.wal-fetch/server.log').read_text()
+        result['owner_error_disconnect_and_honest_reconnect'] = True
 
     # Server cannot race a fallback write: it has never received destination.
     pid = int((source['scope'] / '.wal-fetch/server.pid').read_text())
@@ -292,28 +300,42 @@ try:
     assert int((source['scope'] / '.wal-fetch/server.pid').read_text()) != pid
     result['stale_socket_concurrent_respawn'] = True
 
-    # Idle never cancels active or queued work. Pause ONLY our private WAL sender.
-    idle_scope = RUN / 'idle-client'; idle_scope.mkdir(); scopes.append(idle_scope)
-    fetch(source, closed, RUN / 'idle-warm', scope=idle_scope, idle='300ms')
-    idle_pid = int((idle_scope / '.wal-fetch/server.pid').read_text())
-    idle_slot, row = slot_state(idle_scope)
-    backend = int(row.split('|')[0])
-    os.kill(backend, signal.SIGSTOP)
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            jobs = [pool.submit(fetch, source, closed, RUN / f'idle-active-{i}', scope=idle_scope, idle='300ms') for i in range(2)]
-            time.sleep(0.8)
-            assert (idle_scope / '.wal-fetch/server.sock').exists()
-            os.kill(backend, signal.SIGCONT)
-            for job in jobs: job.result()
-    finally:
-        try: os.kill(backend, signal.SIGCONT)
-        except ProcessLookupError: pass
-    wait_for(lambda: not (idle_scope / '.wal-fetch/server.sock').exists())
-    assert sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{idle_slot}'") == '0'
-    fetch(source, closed, RUN / 'idle-respawn', scope=idle_scope, idle='300ms')
-    assert int((idle_scope / '.wal-fetch/server.pid').read_text()) != idle_pid
-    result['idle_active_queue_cleanup_and_autorespawn'] = True
+    if not NO_SLOT:
+        # Idle never cancels active or queued work. Pause ONLY our private WAL sender.
+        idle_scope = RUN / 'idle-client'; idle_scope.mkdir(); scopes.append(idle_scope)
+        fetch(source, closed, RUN / 'idle-warm', scope=idle_scope, idle='300ms')
+        idle_pid = int((idle_scope / '.wal-fetch/server.pid').read_text())
+        idle_slot, row = slot_state(idle_scope)
+        backend = int(row.split('|')[0])
+        os.kill(backend, signal.SIGSTOP)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                jobs = [pool.submit(fetch, source, closed, RUN / f'idle-active-{i}', scope=idle_scope, idle='300ms') for i in range(2)]
+                time.sleep(0.8)
+                assert (idle_scope / '.wal-fetch/server.sock').exists()
+                os.kill(backend, signal.SIGCONT)
+                for job in jobs: job.result()
+        finally:
+            try: os.kill(backend, signal.SIGCONT)
+            except ProcessLookupError: pass
+        wait_for(lambda: not (idle_scope / '.wal-fetch/server.sock').exists())
+        assert sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{idle_slot}'") == '0'
+        fetch(source, closed, RUN / 'idle-respawn', scope=idle_scope, idle='300ms')
+        assert int((idle_scope / '.wal-fetch/server.pid').read_text()) != idle_pid
+        result['idle_active_queue_cleanup_and_autorespawn'] = True
+
+    else:
+        owner_query = "SELECT pid FROM pg_stat_replication WHERE application_name='wal-fetch-unix'"
+        owner = sql(source, owner_query)
+        assert owner.isdigit(), owner
+        fetch(source, closed, RUN / 'reuse-slotless')
+        assert sql(source, owner_query) == owner
+        sql(source, f'SELECT pg_terminate_backend({owner})')
+        assert fetch(source, closed, unchanged, check=False).returncode != 0
+        fetch(source, closed, RUN / 'reconnect-slotless')
+        assert sql(source, owner_query) != owner
+        assert sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0'
+        result['slotless_same_owner_CopyDone_reuse_and_reconnect'] = True
 
     base = RUN / 'base'
     command(['pg_basebackup', '-h', source['sock'], '-p', source['port'], '-U', 'postgres',
@@ -334,6 +356,8 @@ try:
         f"restore_command='false'\nrecovery_target_lsn='{source_target}'\nrecovery_target_action='promote'\n")
     (leader_dir / 'recovery.signal').touch()
     start(leader)
+    # pg_ctl readiness may mean hot standby; promotion must finish before writes.
+    wait_for(lambda: sql(leader, 'SELECT pg_is_in_recovery();') == 'f', seconds=30)
     sql(leader, "INSERT INTO e2e_marker VALUES(2,'after promotion'); CHECKPOINT;")
     capture = sql(leader, "SELECT timeline_id, checkpoint_lsn, pg_current_wal_flush_lsn(), "
                          "pg_size_bytes(current_setting('wal_segment_size')), "
@@ -381,7 +405,7 @@ try:
     wrapper = RUN / 'restore-wrapper.sh'
     wrapper.write_text('#!/bin/sh\n'
         f'printf "REQUEST %s %s\\n" "$1" "$2" >> "{requests}"\n'
-        f'PGHOST=127.0.0.1 PGPORT={leader["port"]} PGUSER=wal_reader "{helper}" -pgdata "{leader["scope"]}" -idle-timeout 30s -wal-segment-size {SEGMENT_MB}MB "$1" "$2"\n'
+        f'PGHOST=127.0.0.1 PGPORT={leader["port"]} PGUSER=wal_reader "{helper}" {"-no-slot" if NO_SLOT else ""} -pgdata "{leader["scope"]}" -idle-timeout 30s -wal-segment-size {SEGMENT_MB}MB "$1" "$2"\n'
         'status=$?\n'
         f'printf "RESULT %s %s\\n" "$1" "$status" >> "{requests}"\n'
         'exit "$status"\n')
@@ -423,6 +447,14 @@ try:
         own = [line for line in cluster['log'].read_text().splitlines() if ' wal-fetch-unix ' in line]
         assert any('IDENTIFY_SYSTEM' in line for line in own)
         assert not any('SHOW ' in line or 'SELECT ' in line for line in own), own
+        if NO_SLOT:
+            assert not any(re.search(r'CREATE_REPLICATION_SLOT|READ_REPLICATION_SLOT|\bSLOT\b', line) for line in own), own
+    if NO_SLOT:
+        assert sql(leader, 'SELECT count(*) FROM pg_replication_slots') == '0'
+        for logpath in RUN.glob('*/.wal-fetch/server.log'):
+            log = logpath.read_text()
+            assert 'retention lost' not in log and 'retention floor advanced' not in log and 'temporary slot created' not in log
+        result['slotless_zero_slots_and_no_slot_commands'] = True
     result['no_SHOW_or_ordinary_SQL'] = True
     result.update(status='PASS', final_leader_flush_lsn=after,
                   new_history_fetched=True, ancestor_wal_fetched=True,

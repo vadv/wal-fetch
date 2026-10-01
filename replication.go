@@ -55,7 +55,9 @@ func (s *source) close() {
 	s.progress = coverage{}
 }
 func (s *source) lost() {
-	fmt.Fprintln(os.Stderr, "retention lost: owning replication session failed; continuity is not guaranteed")
+	if s.slot != "" {
+		fmt.Fprintln(os.Stderr, "retention lost: owning replication session failed; continuity is not guaranteed")
+	}
 	s.close()
 }
 func (s *source) connect(ctx context.Context) (*pgconn.PgConn, error) {
@@ -112,6 +114,9 @@ func (s *source) ensure(ctx context.Context) error {
 	s.conn, err = s.connect(ctx)
 	if err != nil {
 		return err
+	}
+	if s.o.noSlot {
+		return nil
 	}
 	s.slot = "wal_fetch_" + token()
 	_, err = pglogrepl.CreateReplicationSlot(ctx, s.conn, s.slot, "", pglogrepl.CreateReplicationSlotOptions{Temporary: true, Mode: pglogrepl.PhysicalReplication, SnapshotAction: "RESERVE_WAL"})
@@ -189,10 +194,22 @@ func (s *source) fetch(ctx context.Context, req request, f *os.File) (candidate 
 	if err = f.Truncate(int64(s.o.size)); err != nil {
 		return candidate, errors.New("cannot size staging file")
 	}
+	if s.o.noSlot {
+		return candidate, nil
+	}
 	return s.progress.published(req.tli, start, end), nil
 }
 func (s *source) receive(ctx context.Context, dst io.Writer, tli uint32, start, end pglogrepl.LSN) error {
-	err := pglogrepl.StartReplication(ctx, s.conn, s.slot, start, pglogrepl.StartReplicationOptions{Timeline: int32(tli), Mode: pglogrepl.PhysicalReplication})
+	started := !s.o.noSlot
+	var err error
+	if s.o.noSlot {
+		// The pinned pglogrepl always inserts SLOT, even with an empty name.
+		// Use pgx's existing encoder for this slotless physical command.
+		s.conn.Frontend().SendQuery(&pgproto3.Query{String: fmt.Sprintf("START_REPLICATION PHYSICAL %s TIMELINE %d", start, tli)})
+		err = s.conn.Frontend().Flush()
+	} else {
+		err = pglogrepl.StartReplication(ctx, s.conn, s.slot, start, pglogrepl.StartReplicationOptions{Timeline: int32(tli), Mode: pglogrepl.PhysicalReplication})
+	}
 	if err != nil {
 		return safeError(ctx, "START_REPLICATION", err)
 	}
@@ -204,8 +221,13 @@ func (s *source) receive(ctx context.Context, dst io.Writer, tli uint32, start, 
 			return safeError(ctx, "receive WAL", err)
 		}
 		switch m := msg.(type) {
+		case *pgproto3.CopyBothResponse:
+			if started {
+				return errors.New("unexpected replication response")
+			}
+			started = true
 		case *pgproto3.CopyData:
-			if len(m.Data) == 0 {
+			if !started || len(m.Data) == 0 {
 				return errors.New("empty replication message")
 			}
 			switch m.Data[0] {
@@ -257,6 +279,9 @@ func feedbackData(floor pglogrepl.LSN) []byte {
 	return append(b, 0)
 }
 func (s *source) feedback(floor pglogrepl.LSN) error {
+	if s.o.noSlot {
+		floor = 0
+	}
 	s.conn.Frontend().Send(&pgproto3.CopyData{Data: feedbackData(floor)})
 	if err := s.conn.Frontend().Flush(); err != nil {
 		return err
