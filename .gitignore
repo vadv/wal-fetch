@@ -1,0 +1,4 @@
+/wal-fetch
+*.test
+/.wal-fetch/
+__pycache__/
