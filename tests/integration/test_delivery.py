@@ -8,11 +8,8 @@ import time
 from fixture import lsn, wait_for
 
 
-def completed_wal(fx, source):
+def test_completed_wal(fx, source, closed):
     source_dir = source['data']
-    fx.sql(source, 'CREATE TABLE wal_fixture AS SELECT generate_series(1,10000);')
-    closed = fx.sql(source, 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());')
-    fx.sql(source, 'SELECT pg_switch_wal();')
     completed = fx.run / 'completed.wal'
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda i: fx.fetch(source, closed, fx.run / f'concurrent-{i}.wal'), range(8)))
@@ -22,10 +19,9 @@ def completed_wal(fx, source):
     fx.fetch(source, closed, completed)
     assert completed.read_bytes() == (source_dir / 'pg_wal' / closed).read_bytes()
     fx.result['completed_exact_compare'] = True
-    return closed
 
 
-def quiet_active_wal(fx, source):
+def test_quiet_active_wal(fx, source):
     source_dir = source['data']
     fx.sql(source, 'CHECKPOINT;')
     quiet = fx.sql(source, "SELECT pg_current_wal_flush_lsn(), "
@@ -46,8 +42,8 @@ def quiet_active_wal(fx, source):
     fx.result['quiet_active_prefix_and_zero_tail'] = True
 
 
-def credentials_and_errors(fx, source, closed):
-    completed = fx.run / 'completed.wal'
+def test_credentials_and_errors(fx, source, closed, session):
+    completed = source['data'] / 'pg_wal' / closed
     pgpass = fx.run / 'pgpass'
     pgpass.write_text(f'127.0.0.1:{source["port"]}:replication:wal_reader:disposable-e2e-password\n')
     pgpass.chmod(0o600)
@@ -86,8 +82,8 @@ def credentials_and_errors(fx, source, closed):
     fx.result['different_slot_mode_rejected'] = True
 
 
-def custom_log(fx, source, closed):
-    completed = fx.run / 'completed.wal'
+def test_custom_log(fx, source, closed):
+    completed = source['data'] / 'pg_wal' / closed
     unchanged = fx.run / 'unchanged'
     log_scope = fx.new_scope('log-client')
     custom_log = fx.run / 'custom-server.log'

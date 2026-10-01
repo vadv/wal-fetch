@@ -8,6 +8,8 @@ import signal
 import socket
 import time
 
+import pytest
+
 from fixture import lsn, wait_for
 
 
@@ -63,7 +65,9 @@ def slot_progress(fx, source):
     return first
 
 
-def publication_acknowledgements(fx, source, first):
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
+def test_slot_progress_and_publication_acknowledgements(fx, source, closed):
+    first = slot_progress(fx, source)
     size = fx.segment_mb << 20
     unchanged = fx.run / 'unchanged'
     # Local protocol negative cases on a real owner: no publication ACK, no advance.
@@ -110,7 +114,8 @@ def publication_acknowledgements(fx, source, first):
     fx.result['invalid_or_missing_ACK_never_advances'] = True
 
 
-def owner_failure(fx, source, closed):
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
+def test_owner_failure(fx, source, closed, session):
     unchanged = fx.run / 'unchanged'
     slot, _ = slot_state(fx, source)
     # An ERROR on the actual owning session deletes TEMPORARY; next call is fresh.
@@ -128,7 +133,7 @@ def owner_failure(fx, source, closed):
     fx.result['owner_error_disconnect_and_honest_reconnect'] = True
 
 
-def client_timeout(fx, source, closed):
+def test_client_timeout(fx, source, closed, session):
     unchanged = fx.run / 'unchanged'
     # Server cannot race a fallback write: it has never received destination.
     pid = int((source['scope'] / '.wal-fetch/server.pid').read_text())
@@ -145,7 +150,7 @@ def client_timeout(fx, source, closed):
     fx.result['client_timeout_no_late_destination_write'] = True
 
 
-def stale_socket(fx, source, closed):
+def test_stale_socket(fx, source, closed, session):
     pid = int((source['scope'] / '.wal-fetch/server.pid').read_text())
     # SIGKILL leaves a stale socket; lifetime flock releases and one replacement starts.
     os.kill(pid, signal.SIGKILL)
@@ -155,7 +160,8 @@ def stale_socket(fx, source, closed):
     fx.result['stale_socket_concurrent_respawn'] = True
 
 
-def idle_and_queue(fx, source, closed):
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
+def test_idle_and_queue(fx, source, closed):
     # Idle never cancels active or queued work. Pause ONLY our private WAL sender.
     idle_scope = fx.new_scope('idle-client')
     fx.fetch(source, closed, fx.run / 'idle-warm', scope=idle_scope, idle='300ms')
@@ -185,7 +191,8 @@ def idle_and_queue(fx, source, closed):
     fx.result['idle_active_queue_cleanup_and_autorespawn'] = True
 
 
-def slotless_session_reuse(fx, source, closed):
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') != '1', reason='requires -no-slot')
+def test_slotless_session_reuse(fx, source, closed, session):
     unchanged = fx.run / 'unchanged'
     owner_query = "SELECT pid FROM pg_stat_replication WHERE application_name='wal-fetch-unix'"
     owner = fx.sql(source, owner_query)

@@ -140,6 +140,36 @@ class Fixture:
                     "INSERT INTO e2e_marker VALUES(1,'before backup');")
         return source
 
+    def audit_replication(self):
+        audited = []
+        for cluster in self.clusters:
+            if not cluster['log'].exists():
+                continue
+            own = [line for line in cluster['log'].read_text().splitlines() if ' wal-fetch-unix ' in line]
+            if not own:
+                continue
+            assert any('IDENTIFY_SYSTEM' in line for line in own), own
+            assert not any('SHOW ' in line or 'SELECT ' in line for line in own), own
+            if self.no_slot:
+                assert not any(re.search(r'CREATE_REPLICATION_SLOT|READ_REPLICATION_SLOT|\bSLOT\b', line)
+                               for line in own), own
+            audited.append(cluster['label'])
+        if not audited:
+            return
+        if self.no_slot:
+            for cluster in self.clusters:
+                if (cluster['data'] / 'postmaster.pid').exists():
+                    assert self.sql(cluster, 'SELECT count(*) FROM pg_replication_slots') == '0'
+            logs = list(self.run.glob('*/.wal-fetch/server.log'))
+            if (self.run / 'custom-server.log').exists():
+                logs.append(self.run / 'custom-server.log')
+            for logpath in logs:
+                log = logpath.read_text()
+                assert ('retention lost' not in log and 'retention floor advanced' not in log
+                        and 'temporary slot created' not in log)
+            self.result['slotless_zero_slots_and_no_slot_commands'] = True
+        self.result.update(no_SHOW_or_ordinary_SQL=True, audited_clusters=audited)
+
     def cleanup(self):
         cleanup_errors = []
         for scope in self.scopes:

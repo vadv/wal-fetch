@@ -31,6 +31,12 @@ jobs:
           echo '/usr/lib/postgresql/16/bin' >> "$GITHUB_PATH"
           /usr/lib/postgresql/16/bin/initdb --version | tee diagnostics/postgres-version.txt
           grep -Eq 'PostgreSQL\) 16\.' diagnostics/postgres-version.txt
+      - name: Install integration test dependencies
+        id: pytest
+        run: |
+          python3 -m venv tests/integration/.venv
+          tests/integration/.venv/bin/python -m pip install -r tests/integration/requirements.txt
+          echo "$GITHUB_WORKSPACE/tests/integration/.venv/bin" >> "$GITHUB_PATH"
       - name: Unit tests
         run: go test -count=1 ./... 2>&1 | tee diagnostics/unit.log
       - name: Race detector
@@ -45,15 +51,15 @@ jobs:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
-        run: python3 tests/integration/run.py 2>&1 | tee diagnostics/integration.log
+        run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration.log
       - name: PostgreSQL recovery without slots
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.pytest.outcome == 'success' }}
         env:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
           WAL_FETCH_TEST_NO_SLOT: '1'
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
-        run: python3 tests/integration/run.py 2>&1 | tee diagnostics/integration-no-slot.log
+        run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration-no-slot.log
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4

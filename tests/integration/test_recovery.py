@@ -7,6 +7,15 @@ import time
 from fixture import lsn, wait_for
 
 
+def test_recovery_to_checkpoint(fx, source, session):
+    leader, replica_dir = promote_backup(fx, source)
+    target = capture_target(fx, leader)
+    history_and_ancestor(fx, source, leader, target)
+    ordinary_sql_rejected(fx, leader)
+    replica = restore_replica(fx, leader, replica_dir, target)
+    verify_checkpoint(fx, leader, replica, target)
+
+
 def promote_backup(fx, source):
     source_dir = source['data']
     base = fx.run / 'base'
@@ -151,21 +160,3 @@ def verify_checkpoint(fx, leader, replica, target):
     fx.result.update(final_leader_flush_lsn=after, new_history_fetched=True, ancestor_wal_fetched=True,
                      new_timeline_wal_fetched=True, first_new_timeline_active_segment=True,
                      ordinary_sql_rejected=True, recovery_target_shutdown=True)
-
-
-def replication_commands_only(fx, source, leader):
-    for cluster in (source, leader):
-        own = [line for line in cluster['log'].read_text().splitlines() if ' wal-fetch-unix ' in line]
-        assert any('IDENTIFY_SYSTEM' in line for line in own)
-        assert not any('SHOW ' in line or 'SELECT ' in line for line in own), own
-        if fx.no_slot:
-            assert not any(re.search(r'CREATE_REPLICATION_SLOT|READ_REPLICATION_SLOT|\bSLOT\b', line)
-                           for line in own), own
-    if fx.no_slot:
-        assert fx.sql(leader, 'SELECT count(*) FROM pg_replication_slots') == '0'
-        for logpath in fx.run.glob('*/.wal-fetch/server.log'):
-            log = logpath.read_text()
-            assert ('retention lost' not in log and 'retention floor advanced' not in log
-                    and 'temporary slot created' not in log)
-        fx.result['slotless_zero_slots_and_no_slot_commands'] = True
-    fx.result['no_SHOW_or_ordinary_SQL'] = True

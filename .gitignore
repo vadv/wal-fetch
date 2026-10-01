@@ -2,3 +2,5 @@
 *.test
 /.wal-fetch/
 __pycache__/
+/tests/integration/.venv/
+/tests/integration/.pytest_cache/
