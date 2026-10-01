@@ -130,7 +130,7 @@ func TestClientPublication(t *testing.T) {
 					return
 				}
 				defer c.Close()
-				_ = c.SetDeadline(time.Now().Add(time.Second))
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 				var q wireRequest
 				if e = readJSON(bufio.NewReader(c), &q); e != nil {
 					done <- e
@@ -144,7 +144,7 @@ func TestClientPublication(t *testing.T) {
 						return
 					}
 					defer c.Close()
-					_ = c.SetDeadline(time.Now().Add(time.Second))
+					_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 					if e = readJSON(bufio.NewReader(c), &q); e != nil {
 						done <- e
 						return
@@ -193,7 +193,11 @@ func TestClientPublication(t *testing.T) {
 			}()
 			dest := filepath.Join(dir, "destination")
 			_ = os.WriteFile(dest, []byte("ORIGINAL"), 0600)
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			timeout := 5 * time.Second // Successful publication includes a real fsync.
+			if mode == "timeout" {
+				timeout = 100 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			err := client(ctx, options{dir: dir, identity: "config", size: 16 << 20}, "00000002.history", dest)
 			ok := mode == "complete" || mode == "ack-lost" || mode == "retry-close"

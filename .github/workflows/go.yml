@@ -38,6 +38,7 @@ jobs:
       - name: Vet
         run: go vet ./... 2>&1 | tee diagnostics/vet.log
       - name: Build static binary
+        id: build
         run: CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o wal-fetch . 2>&1 | tee diagnostics/build.log
       - name: PostgreSQL recovery and slot lifecycle
         env:
@@ -46,7 +47,7 @@ jobs:
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
         run: python3 integration.py 2>&1 | tee diagnostics/integration.log
       - name: PostgreSQL recovery without slots
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
           WAL_FETCH_TEST_NO_SLOT: '1'
