@@ -336,6 +336,9 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 		}
 	} else {
 		candidate, err = s.fetch(ctx, req, f)
+		if err != nil {
+			s.failedFetch()
+		}
 	}
 	if err != nil {
 		if !req.history && s.streaming {
@@ -346,10 +349,11 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 	}
 	// Always end COPY, including invalid/missing client ACKs. Do not advertise
 	// anything until publication was acknowledged by this request's client.
+	walPublished := false
 	if !req.history {
 		defer func() {
 			if s.conn != nil && s.streaming {
-				if e := s.finish(ctx); e != nil {
+				if e := s.finish(ctx, walPublished); e != nil {
 					s.lost()
 				}
 			}
@@ -391,7 +395,8 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 		return
 	}
 	outcome = "fetched"
-	if !req.history && !s.o.noSlot {
+	walPublished = !req.history
+	if !req.history && s.usesSlot() {
 		if candidate.floor > s.progress.floor {
 			if err = s.feedback(candidate.floor); err != nil {
 				s.lost()

@@ -76,7 +76,7 @@ def test_slot_progress_and_publication_acknowledgements(fx, source, closed):
     identity_values = ['127.0.0.1', source['port'], 'wal_reader', fx.env['PGPASSWORD'],
                        'replication', {'application_name':'wal-fetch-unix', 'replication':'yes'},
                        size, '30s', str(source['scope'].resolve()), fx.no_slot,
-                       str(source['scope'] / '.wal-fetch/server.log'), False]
+                       str(source['scope'] / '.wal-fetch/server.log'), False, 5]
     for key in ('PGSSLMODE', 'PGSSLROOTCERT', 'PGSSLCERT', 'PGSSLKEY', 'PGSSLCRL',
                 'PGSSLSNI', 'PGCHANNELBINDING', 'PGSERVICE', 'PGSERVICEFILE'):
         identity_values.extend((key, fx.env.get(key, '')))
@@ -205,3 +205,71 @@ def test_slotless_session_reuse(fx, source, closed, session):
     assert fx.sql(source, owner_query) != owner
     assert fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0'
     fx.result['slotless_same_owner_CopyDone_reuse_and_reconnect'] = True
+
+
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
+@pytest.mark.parametrize('missing', ['future', 'removed'])
+def test_repeated_wal_misses_release_slot(fx, source, closed, session, missing):
+    name = wal_name(1000, fx.segment_mb << 20) if missing == 'future' else wal_name(0, fx.segment_mb << 20)
+    dest = fx.run / 'unavailable.wal'
+    original_slot = slot_state(fx, source)[0]
+
+    def reject(filename):
+        dest.write_bytes(b'ORIGINAL')
+        failed = fx.fetch(source, filename, dest, check=False)
+        assert failed.returncode != 0 and dest.read_bytes() == b'ORIGINAL'
+        if filename == name and missing == 'removed':
+            assert 'SQLSTATE 58P01' in failed.stdout, failed.stdout
+
+    # A published WAL resets four misses; history probes do not change the count.
+    for _ in range(4):
+        reject(name)
+    reject('00000003.history')
+    if missing == 'future':
+        assert slot_state(fx, source)[0] == original_slot and slot_state(fx, source)[1]
+    else:
+        wait_for(lambda: fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0')
+    fx.fetch(source, closed, fx.run / 'reset-failures.wal')
+    reset_slot = slot_state(fx, source)[0]
+    for _ in range(4):
+        reject(name)
+    reject('00000003.history')
+    if missing == 'future':
+        assert slot_state(fx, source)[0] == reset_slot and slot_state(fx, source)[1]
+    reject(name)
+    wait_for(lambda: fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0')
+
+    # Retries, including PostgreSQL errors on the owning connection, stay slotless.
+    creates = source['log'].read_text().count('CREATE_REPLICATION_SLOT')
+    for retry in (name, '00000003.history', wal_name(0, fx.segment_mb << 20), name):
+        reject(retry)
+        assert fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0'
+    assert source['log'].read_text().count('CREATE_REPLICATION_SLOT') == creates
+
+    # The successful probe publishes exact bytes; only the following call gets a slot.
+    fx.fetch(source, closed, dest)
+    assert dest.read_bytes() == (source['data'] / 'pg_wal' / closed).read_bytes()
+    assert fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0'
+    fx.fetch(source, closed, fx.run / 'retention-restored.wal')
+    assert fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '1'
+    assert slot_state(fx, source)[0] != reset_slot
+    fx.result['repeated_misses_release_probe_and_rearm'] = True
+
+
+@pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
+@pytest.mark.parametrize('limit', [0, 2])
+def test_slot_failure_limit_option(fx, source, closed, limit):
+    dest = fx.run / 'limit-option.wal'
+    fx.fetch(source, closed, dest, slot_failure_limit=limit)
+    original = slot_state(fx, source)
+    mismatch = fx.fetch(source, closed, dest, check=False)
+    assert mismatch.returncode and 'configuration mismatch' in mismatch.stdout
+    for _ in range(6 if limit == 0 else limit):
+        failure = fx.fetch(source, wal_name(1000, fx.segment_mb << 20), dest,
+                           check=False, slot_failure_limit=limit)
+        assert failure.returncode != 0
+    if limit == 0:
+        assert slot_state(fx, source) == original and original[1]
+    else:
+        wait_for(lambda: fx.sql(source, 'SELECT count(*) FROM pg_replication_slots') == '0')
+    fx.result['slot_failure_limit_override_or_disabled'] = True

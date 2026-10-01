@@ -23,14 +23,15 @@ import (
 )
 
 type options struct {
-	cfg           *pgconn.Config
-	dir, identity string
-	size          uint64
-	timeout, idle time.Duration
-	serve, noSlot bool
-	logFile       string
-	syslog        bool
-	args          []string
+	cfg              *pgconn.Config
+	dir, identity    string
+	size             uint64
+	timeout, idle    time.Duration
+	serve, noSlot    bool
+	logFile          string
+	syslog           bool
+	slotFailureLimit int
+	args             []string
 }
 
 func main() {
@@ -53,6 +54,7 @@ func run(args []string) error {
 	fs.DurationVar(&o.idle, "idle-timeout", 5*time.Minute, "server idle timeout")
 	fs.BoolVar(&o.serve, "serve", false, "run server in foreground")
 	fs.BoolVar(&o.noSlot, "no-slot", false, "fetch without a temporary slot or WAL retention")
+	fs.IntVar(&o.slotFailureLimit, "slot-failure-limit", 5, "consecutive WAL fetch failures before suspending slots (0 disables)")
 	fs.StringVar(&o.logFile, "log-file", "", "server log file (default PGDATA/.wal-fetch/server.log)")
 	fs.BoolVar(&o.syslog, "syslog", false, "also send server logs to local syslog")
 	help := fs.Bool("help", false, "show usage")
@@ -60,11 +62,14 @@ func run(args []string) error {
 		return errors.New("invalid arguments; use -help")
 	}
 	if *help {
-		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] [-log-file PATH] [-syslog] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
+		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] [-slot-failure-limit 5] [-log-file PATH] [-syslog] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\n-slot-failure-limit 0 disables automatic slot suspension.\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
 		return nil
 	}
 	if o.timeout <= 0 || o.idle <= 0 || (!o.serve && fs.NArg() != 2) {
 		return errors.New("expected WAL_NAME DESTINATION and positive timeouts")
+	}
+	if o.slotFailureLimit < 0 {
+		return errors.New("slot-failure-limit must be nonnegative")
 	}
 	var err error
 	o.size, err = segmentSize(*sizeText)
@@ -121,7 +126,7 @@ func run(args []string) error {
 	}
 	// A digest binds every request to the effective credentials/configuration;
 	// neither credentials nor a connection string are sent over the Unix socket.
-	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root, o.noSlot, o.logFile, o.syslog}
+	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root, o.noSlot, o.logFile, o.syslog, o.slotFailureLimit}
 	for _, key := range []string{"PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGCHANNELBINDING", "PGSERVICE", "PGSERVICEFILE"} {
 		value := os.Getenv(key)
 		identity = append(identity, key, value)

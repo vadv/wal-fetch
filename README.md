@@ -14,6 +14,10 @@ Recovery can spend time replaying a file before requesting the next one. Meanwhi
 
 Use **`-no-slot`** to disable slot creation when WAL retention is managed elsewhere.
 
+After **5 failed WAL fetches without a successful publication**, wal-fetch releases the slot and retries without creating another. Once a WAL file is published and the replication exchange finishes successfully, the next WAL request can create a new slot. History requests do not affect the counter. Set `-slot-failure-limit N` to change the threshold, or `0` to disable it.
+
+A PostgreSQL error while reading recycled WAL releases the slot immediately. The threshold also covers repeated local rejections, such as a future segment. A replacement slot cannot recover WAL recycled during the gap.
+
 ## Usage
 
 Set connection settings in the PostgreSQL service environment:
@@ -44,6 +48,7 @@ wal-fetch -no-slot -pgdata /var/lib/postgresql/data WAL_NAME DESTINATION
 | `-h`, `-p`, `-U` | PostgreSQL environment | Source host, port and user |
 | `-pgdata` | `PGDATA` or current directory | Directory for the local server socket and log |
 | `-no-slot` | `false` | Fetch without reserving WAL |
+| `-slot-failure-limit` | `5` | Failed WAL fetches before suspending slot creation; `0` disables the limit |
 | `-log-file` | `<pgdata>/.wal-fetch/server.log` | Server log file |
 | `-syslog` | `false` | Also send server logs to local syslog |
 | `-idle-timeout` | `5m` | Stop the server after inactivity |

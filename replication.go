@@ -41,7 +41,25 @@ type source struct {
 	progress                         coverage
 	acked                            pglogrepl.LSN
 	streaming                        bool
+	failedWAL                        int
+	slotSuspended                    bool
 	logger                           *log.Logger
+}
+
+func (s *source) usesSlot() bool {
+	return !s.o.noSlot && !s.slotSuspended
+}
+
+func (s *source) failedFetch() {
+	if s.o.noSlot || s.o.slotFailureLimit == 0 || s.slotSuspended {
+		return
+	}
+	s.failedWAL++
+	if s.failedWAL >= s.o.slotFailureLimit {
+		s.close()
+		s.slotSuspended = true
+		s.logf("temporary slots suspended after %d WAL fetch failures; probing without retention", s.failedWAL)
+	}
 }
 
 func (s *source) close() {
@@ -117,7 +135,7 @@ func (s *source) ensure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if s.o.noSlot {
+	if !s.usesSlot() {
 		return nil
 	}
 	s.slot = "wal_fetch_" + token()
@@ -196,15 +214,15 @@ func (s *source) fetch(ctx context.Context, req request, f *os.File) (candidate 
 	if err = f.Truncate(int64(s.o.size)); err != nil {
 		return candidate, errors.New("cannot size staging file")
 	}
-	if s.o.noSlot {
+	if !s.usesSlot() {
 		return candidate, nil
 	}
 	return s.progress.published(req.tli, start, end), nil
 }
 func (s *source) receive(ctx context.Context, dst io.Writer, tli uint32, start, end pglogrepl.LSN) error {
-	started := !s.o.noSlot
+	started := s.usesSlot()
 	var err error
-	if s.o.noSlot {
+	if !s.usesSlot() {
 		// The pinned pglogrepl always inserts SLOT, even with an empty name.
 		// Use pgx's existing encoder for this slotless physical command.
 		s.conn.Frontend().SendQuery(&pgproto3.Query{String: fmt.Sprintf("START_REPLICATION PHYSICAL %s TIMELINE %d", start, tli)})
@@ -281,7 +299,7 @@ func feedbackData(floor pglogrepl.LSN) []byte {
 	return append(b, 0)
 }
 func (s *source) feedback(floor pglogrepl.LSN) error {
-	if s.o.noSlot {
+	if !s.usesSlot() {
 		floor = 0
 	}
 	s.conn.Frontend().Send(&pgproto3.CopyData{Data: feedbackData(floor)})
@@ -293,7 +311,7 @@ func (s *source) feedback(floor pglogrepl.LSN) error {
 	}
 	return nil
 }
-func (s *source) finish(ctx context.Context) error {
+func (s *source) finish(ctx context.Context, published bool) error {
 	// The pinned helper drains CopyData, CopyDone, rows and CommandComplete
 	// through ReadyForQuery. Our net deadline bounds its synchronous reads.
 	_, err := pglogrepl.SendStandbyCopyDone(ctx, s.conn)
@@ -301,5 +319,16 @@ func (s *source) finish(ctx context.Context) error {
 		return safeError(ctx, "finish replication", err)
 	}
 	s.streaming = false
-	return s.conn.Conn().SetDeadline(time.Time{})
+	if err := s.conn.Conn().SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	if published && !s.o.noSlot {
+		s.failedWAL = 0
+		if s.slotSuspended {
+			s.close()
+			s.slotSuspended = false
+			s.logf("temporary slots re-enabled after confirmed WAL publication; earlier WAL is not guaranteed")
+		}
+	}
+	return nil
 }

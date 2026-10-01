@@ -110,7 +110,8 @@ class Fixture:
                 self.command(['pg_ctl', '-D', c['data'], '-m', 'immediate', '-w', '-t', '10', 'stop'],
                              check=False, timeout=15)
 
-    def fetch(self, c, name, dest, *, check=True, env_patch=None, timeout=40, scope=None, idle='30s', log_file=None):
+    def fetch(self, c, name, dest, *, check=True, env_patch=None, timeout=40, scope=None, idle='30s',
+              log_file=None, slot_failure_limit=None):
         env = dict(self.env, PGHOST='127.0.0.1', PGPORT=str(c['port']), PGUSER='wal_reader')
         env.update(env_patch or {})
         env = {k: v for k, v in env.items() if v is not None}
@@ -118,6 +119,8 @@ class Fixture:
         args = [self.binary, '-pgdata', scope or c['scope'], '-idle-timeout', idle, '-timeout', limit + 's']
         if log_file is not None:
             args += ['-log-file', str(log_file)]
+        if slot_failure_limit is not None:
+            args += ['-slot-failure-limit', str(slot_failure_limit)]
         if self.no_slot:
             args += ['-no-slot']
         if self.segment_mb != 16:
