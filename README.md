@@ -78,8 +78,8 @@ Linux, Go 1.25. Recovery tests require Python 3, PostgreSQL 16 tools on `PATH` a
 ```sh
 go build -o wal-fetch .
 go test ./...
-python3 integration.py
-WAL_FETCH_TEST_SEGMENT_MB=1 python3 integration.py
+python3 tests/integration/run.py
+WAL_FETCH_TEST_SEGMENT_MB=1 python3 tests/integration/run.py
 ```
 
 CI runs unit/race/vet checks and real recovery with 16 MiB and 1 MiB WAL segments, with and without a slot. It checks timeline history, recovery to the target checkpoint, slot lifecycle and failure handling.

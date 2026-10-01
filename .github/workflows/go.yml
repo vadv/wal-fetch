@@ -45,7 +45,7 @@ jobs:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
-        run: python3 integration.py 2>&1 | tee diagnostics/integration.log
+        run: python3 tests/integration/run.py 2>&1 | tee diagnostics/integration.log
       - name: PostgreSQL recovery without slots
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
@@ -53,7 +53,7 @@ jobs:
           WAL_FETCH_TEST_NO_SLOT: '1'
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
-        run: python3 integration.py 2>&1 | tee diagnostics/integration-no-slot.log
+        run: python3 tests/integration/run.py 2>&1 | tee diagnostics/integration-no-slot.log
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
