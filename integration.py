@@ -111,12 +111,13 @@ try:
     sql(source, "CREATE ROLE wal_reader LOGIN REPLICATION PASSWORD 'disposable-e2e-password'; "
                 "CREATE TABLE e2e_marker(id int PRIMARY KEY, value text); "
                 "INSERT INTO e2e_marker VALUES(1,'before backup');")
-    def fetch(c, name, dest, *, check=True, env_patch=None, timeout=40, scope=None, idle='30s'):
+    def fetch(c, name, dest, *, check=True, env_patch=None, timeout=40, scope=None, idle='30s', log_file=None):
         env = dict(ENV, PGHOST='127.0.0.1', PGPORT=str(c['port']), PGUSER='wal_reader')
         env.update(env_patch or {})
         env = {k: v for k, v in env.items() if v is not None}
         limit = env.pop('WAL_FETCH_TIMEOUT', '30')
         args = [helper, '-pgdata', scope or c['scope'], '-idle-timeout', idle, '-timeout', limit + 's']
+        if log_file is not None: args += ['-log-file', str(log_file)]
         if NO_SLOT: args += ['-no-slot']
         if SEGMENT_MB != 16: args += ['-wal-segment-size', f'{SEGMENT_MB}MB']
         return command(args + [name, dest], check=check, timeout=timeout, env=env)
@@ -184,6 +185,26 @@ try:
             time.sleep(0.03)
         raise AssertionError('condition did not become true')
 
+    log_scope = RUN / 'log-client'; log_scope.mkdir(); scopes.append(log_scope)
+    custom_log = RUN / 'custom-server.log'
+    fetch(source, closed, RUN / 'log-success', scope=log_scope, log_file=os.path.relpath(custom_log))
+    assert (RUN / 'log-success').read_bytes() == completed.read_bytes()
+    probe = '000000010000000000000FFF'
+    assert fetch(source, probe, unchanged, check=False, scope=log_scope, log_file=custom_log).returncode != 0
+    mismatch = fetch(source, closed, unchanged, check=False, scope=log_scope, log_file=RUN / 'other.log')
+    assert mismatch.returncode and 'configuration mismatch' in mismatch.stdout
+    os.kill(int((log_scope / '.wal-fetch/server.pid').read_text()), signal.SIGTERM)
+    wait_for(lambda: not (log_scope / '.wal-fetch/server.sock').exists())
+    log_text = custom_log.read_text()
+    assert re.search(r'\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} wal-fetch\[\d+\]', log_text), log_text
+    assert f'fetched name={closed} bytes={SEGMENT_MB << 20}' in log_text
+    assert 'rejected error=' in log_text and f'name={probe}' in log_text
+    assert 'server started' in log_text and 'server stopped' in log_text
+    assert ENV['PGPASSWORD'] not in log_text and 'password=' not in log_text and 'host=' not in log_text
+    assert custom_log.stat().st_mode & 0o777 == 0o600
+    assert not (log_scope / '.wal-fetch/server.log').exists()
+    result['custom_log_success_failure_identity_and_no_secrets'] = True
+
     if not NO_SLOT:
         # Slot progress is measured on the real server, not inferred from logs.
         def slot_state(scope):
@@ -234,7 +255,8 @@ try:
         # in our controlled environment; it contains no credential in the wire request.
         identity_values = ['127.0.0.1', source['port'], 'wal_reader', ENV['PGPASSWORD'],
                            'replication', {'application_name':'wal-fetch-unix', 'replication':'yes'},
-                           size, '30s', str(source['scope'].resolve()), NO_SLOT]
+                           size, '30s', str(source['scope'].resolve()), NO_SLOT,
+                           str(source['scope'] / '.wal-fetch/server.log'), False]
         for key in ('PGSSLMODE','PGSSLROOTCERT','PGSSLCERT','PGSSLKEY','PGSSLCRL','PGSSLSNI','PGCHANNELBINDING','PGSERVICE','PGSERVICEFILE'):
             identity_values.extend((key, ENV.get(key, '')))
         identity = hashlib.sha256(json.dumps(identity_values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -493,7 +515,7 @@ finally:
     # An allowlist, redaction and bounded tails keep CI artifacts small and safe.
     out = EVIDENCE / RUN.name
     out.mkdir(parents=True, exist_ok=True)
-    names = ('commands.log', 'source.log', 'leader.log', 'replica.log',
+    names = ('commands.log', 'source.log', 'leader.log', 'replica.log', 'custom-server.log',
              'restore-requests.log', 'replica-controldata.txt', 'ordinary-sql-rejected.log')
     logs = [(RUN / name, name) for name in names]
     logs += [(scope / '.wal-fetch/server.log', scope.name + '-server.log') for scope in scopes]

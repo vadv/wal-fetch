@@ -168,9 +168,23 @@ func safeLocalMessage(s string) string {
 	return s
 }
 
-func serve(o options) error {
+func serve(o options) (serveErr error) {
+	var ready *os.File
+	if os.Getenv("WAL_FETCH_INHERITED_LOCK") == "1" {
+		ready = os.NewFile(4, "server.ready")
+		defer func() {
+			if serveErr != nil {
+				fmt.Fprintln(ready, safeLocalMessage(serveErr.Error()))
+			}
+			ready.Close()
+		}()
+	}
+	logs, err := openServerLog(o)
+	if err != nil {
+		return err
+	}
+	defer logs.Close()
 	var lock *os.File
-	var err error
 	if os.Getenv("WAL_FETCH_INHERITED_LOCK") == "1" {
 		lock = os.NewFile(3, "server.lock")
 	} else {
@@ -221,13 +235,17 @@ func serve(o options) error {
 		return errors.New("cannot write server PID")
 	}
 	defer os.Remove(pidpath)
-	s := source{o: o}
+	s := source{o: o, logger: logs.logger}
 	defer s.close()
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
-	fmt.Fprintf(os.Stderr, "server started pid=%d\n", os.Getpid())
-	defer fmt.Fprintln(os.Stderr, "server stopped")
+	s.logf("server started")
+	defer s.logf("server stopped")
+	if ready != nil {
+		_, _ = ready.WriteString("ready\n")
+		ready.Close()
+	}
 	for {
 		// The serial accept loop has no internal queue. Kernel-queued clients are
 		// accepted immediately; the idle clock runs only while waiting in Accept.
@@ -257,7 +275,19 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 	deadline := time.Now().Add(s.o.timeout)
 	_ = c.SetDeadline(deadline)
 	r := bufio.NewReaderSize(c, maxLine)
-	fail := func(err error) { _ = writeJSON(c, wireHeader{Version: protocolVersion, Error: err.Error()}) }
+	name, outcome := "", "rejected error=incomplete request"
+	var payloadSize int64
+	defer func() {
+		if name == "" {
+			s.logf("%s", outcome)
+		} else {
+			s.logf("%s name=%s bytes=%d", outcome, name, payloadSize)
+		}
+	}()
+	fail := func(err error) {
+		outcome = "rejected error=" + safeLocalMessage(err.Error())
+		_ = writeJSON(c, wireHeader{Version: protocolVersion, Error: err.Error()})
+	}
 	var q wireRequest
 	if err := readJSON(r, &q); err != nil {
 		fail(err)
@@ -276,6 +306,7 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 		fail(err)
 		return
 	}
+	name = q.Name // parseRequest has validated every byte.
 	clientEnd := time.Unix(0, q.Deadline)
 	if clientEnd.Before(deadline) {
 		deadline = clientEnd
@@ -299,7 +330,9 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 		var data []byte
 		data, err = s.history(ctx, req.tli)
 		if err == nil {
-			_, err = f.Write(data)
+			if _, err = f.Write(data); err != nil {
+				err = errors.New("write staging file failed")
+			}
 		}
 	} else {
 		candidate, err = s.fetch(ctx, req, f)
@@ -340,6 +373,8 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 		fail(errors.New("seek staging file failed"))
 		return
 	}
+	payloadSize = stat.Size()
+	outcome = "publication unconfirmed"
 	id := token()
 	h := wireHeader{Version: protocolVersion, OK: true, Length: stat.Size(), SHA256: hex.EncodeToString(digest.Sum(nil)), ID: id}
 	if writeJSON(c, h) != nil {
@@ -355,13 +390,14 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 	if readJSON(r, &ack) != nil || ack.Version != protocolVersion || ack.ID != id || !ack.Published {
 		return
 	}
+	outcome = "fetched"
 	if !req.history && !s.o.noSlot {
 		if candidate.floor > s.progress.floor {
 			if err = s.feedback(candidate.floor); err != nil {
 				s.lost()
 				return
 			}
-			fmt.Fprintf(os.Stderr, "retention floor advanced to %s\n", candidate.floor)
+			s.logf("retention floor advanced to %s", candidate.floor)
 		}
 		s.progress = candidate
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"io"
+	"log"
 	"net"
 	"os"
 	"time"
@@ -40,6 +41,7 @@ type source struct {
 	progress                         coverage
 	acked                            pglogrepl.LSN
 	streaming                        bool
+	logger                           *log.Logger
 }
 
 func (s *source) close() {
@@ -56,7 +58,7 @@ func (s *source) close() {
 }
 func (s *source) lost() {
 	if s.slot != "" {
-		fmt.Fprintln(os.Stderr, "retention lost: owning replication session failed; continuity is not guaranteed")
+		s.logf("retention lost: owning replication session failed; continuity is not guaranteed")
 	}
 	s.close()
 }
@@ -139,7 +141,7 @@ func (s *source) ensure(ctx context.Context) error {
 		return errors.New("slot has no reserved WAL")
 	}
 	s.progress = coverage{floor: floor, end: floor}
-	fmt.Fprintf(os.Stderr, "temporary slot created name=%s floor=%s; earlier WAL is not guaranteed\n", s.slot, floor)
+	s.logf("temporary slot created name=%s floor=%s; earlier WAL is not guaranteed", s.slot, floor)
 	return nil
 }
 func (s *source) fetch(ctx context.Context, req request, f *os.File) (candidate coverage, err error) {

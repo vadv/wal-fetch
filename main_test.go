@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -77,12 +78,13 @@ func TestBoundedProtocol(t *testing.T) {
 	}
 }
 func TestServerRejectsBeforeConnecting(t *testing.T) {
-	for _, q := range []wireRequest{{Version: 99}, {Version: 1, Identity: "wrong"}, {Version: 1, Identity: "right", Name: "../wal"}} {
+	for _, q := range []wireRequest{{Version: 99}, {Version: 1, Identity: "wrong"}, {Version: 1, Identity: "right", Name: "../secret-password\ninjected"}} {
 		dir := t.TempDir()
 		ln, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "server.sock"), Net: "unix"})
 		if e != nil {
 			t.Fatal(e)
 		}
+		var records bytes.Buffer
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -91,7 +93,7 @@ func TestServerRejectsBeforeConnecting(t *testing.T) {
 				return
 			}
 			defer c.Close()
-			s := source{o: options{dir: dir, identity: "right", timeout: time.Second}}
+			s := source{o: options{dir: dir, identity: "right", timeout: time.Second}, logger: log.New(&records, "", 0)}
 			s.handle(context.Background(), c)
 		}()
 		c, e := net.DialUnix("unix", nil, ln.Addr().(*net.UnixAddr))
@@ -106,6 +108,9 @@ func TestServerRejectsBeforeConnecting(t *testing.T) {
 		c.Close()
 		ln.Close()
 		<-done
+		if !strings.Contains(records.String(), "rejected error=") || strings.Contains(records.String(), "secret-password") || strings.Contains(records.String(), "injected") {
+			t.Fatalf("unsafe rejection log: %s", records.String())
+		}
 	}
 }
 func TestClientPublication(t *testing.T) {

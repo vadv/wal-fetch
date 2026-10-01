@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,6 +28,8 @@ type options struct {
 	size          uint64
 	timeout, idle time.Duration
 	serve, noSlot bool
+	logFile       string
+	syslog        bool
 	args          []string
 }
 
@@ -50,12 +53,14 @@ func run(args []string) error {
 	fs.DurationVar(&o.idle, "idle-timeout", 5*time.Minute, "server idle timeout")
 	fs.BoolVar(&o.serve, "serve", false, "run server in foreground")
 	fs.BoolVar(&o.noSlot, "no-slot", false, "fetch without a temporary slot or WAL retention")
+	fs.StringVar(&o.logFile, "log-file", "", "server log file (default PGDATA/.wal-fetch/server.log)")
+	fs.BoolVar(&o.syslog, "syslog", false, "also send server logs to local syslog")
 	help := fs.Bool("help", false, "show usage")
 	if fs.Parse(args) != nil {
 		return errors.New("invalid arguments; use -help")
 	}
 	if *help {
-		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
+		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] [-log-file PATH] [-syslog] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
 		return nil
 	}
 	if o.timeout <= 0 || o.idle <= 0 || (!o.serve && fs.NArg() != 2) {
@@ -92,6 +97,13 @@ func run(args []string) error {
 	if err = privateDirectory(o.dir); err != nil {
 		return err
 	}
+	if o.logFile == "" {
+		o.logFile = filepath.Join(o.dir, "server.log")
+	}
+	o.logFile, err = filepath.Abs(o.logFile)
+	if err != nil {
+		return errors.New("invalid server log path")
+	}
 	dsn := "replication=yes dbname=replication application_name=wal-fetch-unix target_session_attrs=any"
 	for _, kv := range [][2]string{{"host", *host}, {"port", *port}, {"user", *user}} {
 		if kv[1] != "" {
@@ -109,7 +121,7 @@ func run(args []string) error {
 	}
 	// A digest binds every request to the effective credentials/configuration;
 	// neither credentials nor a connection string are sent over the Unix socket.
-	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root, o.noSlot}
+	identity := []any{o.cfg.Host, o.cfg.Port, o.cfg.User, o.cfg.Password, o.cfg.Database, o.cfg.RuntimeParams, o.size, o.idle.String(), root, o.noSlot, o.logFile, o.syslog}
 	for _, key := range []string{"PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLSNI", "PGCHANNELBINDING", "PGSERVICE", "PGSERVICEFILE"} {
 		value := os.Getenv(key)
 		identity = append(identity, key, value)
@@ -205,24 +217,42 @@ func connectLocal(ctx context.Context, o options) (*net.UnixConn, error) {
 					f.Close()
 					return nil, errors.New("cannot locate executable")
 				}
-				log, e := os.OpenFile(filepath.Join(o.dir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0600)
+				log, e := openLogFile(o.logFile)
 				if e != nil {
 					f.Close()
-					return nil, errors.New("cannot open server log")
+					return nil, e
+				}
+				ready, notify, e := os.Pipe()
+				if e != nil {
+					log.Close()
+					f.Close()
+					return nil, errors.New("cannot create server startup pipe")
 				}
 				cmd := exec.Command(executable, append([]string{"-serve"}, o.args...)...)
 				cmd.Env = append(os.Environ(), "WAL_FETCH_INHERITED_LOCK=1")
-				cmd.ExtraFiles = []*os.File{f}
+				cmd.ExtraFiles = []*os.File{f, notify}
 				cmd.Stdout = log
 				cmd.Stderr = log
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 				e = cmd.Start()
+				notify.Close()
 				log.Close()
 				f.Close() // Do not unlock the inherited open-file description.
 				if e != nil {
+					ready.Close()
 					return nil, errors.New("cannot start detached server")
 				}
 				_ = cmd.Process.Release()
+				deadline, _ := ctx.Deadline()
+				_ = ready.SetReadDeadline(deadline)
+				status, e := bufio.NewReaderSize(ready, maxLine).ReadSlice('\n')
+				ready.Close()
+				if e != nil {
+					return nil, errors.New("server startup failed")
+				}
+				if string(status) != "ready\n" {
+					return nil, fmt.Errorf("server startup: %s", safeLocalMessage(strings.TrimSpace(string(status))))
+				}
 			}
 		} else {
 			f.Close()
