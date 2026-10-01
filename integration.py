@@ -341,7 +341,8 @@ try:
             try: os.kill(backend, signal.SIGCONT)
             except ProcessLookupError: pass
         wait_for(lambda: not (idle_scope / '.wal-fetch/server.sock').exists())
-        assert sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{idle_slot}'") == '0'
+        # Closing the connection precedes PostgreSQL processing its disconnect.
+        wait_for(lambda: sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{idle_slot}'") == '0')
         fetch(source, closed, RUN / 'idle-respawn', scope=idle_scope, idle='300ms')
         assert int((idle_scope / '.wal-fetch/server.pid').read_text()) != idle_pid
         result['idle_active_queue_cleanup_and_autorespawn'] = True
