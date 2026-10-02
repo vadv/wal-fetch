@@ -114,7 +114,7 @@ func TestServerRejectsBeforeConnecting(t *testing.T) {
 	}
 }
 func TestClientPublication(t *testing.T) {
-	for _, mode := range []string{"complete", "ack-lost", "version", "length", "truncated", "extra", "digest", "id", "retry-close", "timeout", "malformed"} {
+	for _, mode := range []string{"complete", "ack-lost", "version", "length", "truncated", "extra", "digest", "id", "retry-close", "source-changed", "timeout", "malformed"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			ln, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "server.sock"), Net: "unix"})
@@ -137,6 +137,24 @@ func TestClientPublication(t *testing.T) {
 					return
 				}
 				if mode == "retry-close" {
+					c.Close()
+					c, e = ln.AcceptUnix()
+					if e != nil {
+						done <- e
+						return
+					}
+					defer c.Close()
+					_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+					if e = readJSON(bufio.NewReader(c), &q); e != nil {
+						done <- e
+						return
+					}
+				}
+				if mode == "source-changed" {
+					if e = writeJSON(c, wireHeader{Version: 1, Error: errSourceChanged.Error()}); e != nil {
+						done <- e
+						return
+					}
 					c.Close()
 					c, e = ln.AcceptUnix()
 					if e != nil {
@@ -180,7 +198,7 @@ func TestClientPublication(t *testing.T) {
 				}
 				_, _ = c.Write(payload)
 				_ = c.CloseWrite()
-				if mode == "complete" || mode == "retry-close" {
+				if mode == "complete" || mode == "retry-close" || mode == "source-changed" {
 					var ack wireACK
 					e = readJSON(bufio.NewReader(c), &ack)
 					if e == nil && (!ack.Published || ack.ID != h.ID) {
@@ -200,7 +218,7 @@ func TestClientPublication(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			err := client(ctx, options{dir: dir, identity: "config", size: 16 << 20}, "00000002.history", dest)
-			ok := mode == "complete" || mode == "ack-lost" || mode == "retry-close"
+			ok := mode == "complete" || mode == "ack-lost" || mode == "retry-close" || mode == "source-changed"
 			if (err == nil) != ok {
 				t.Fatalf("%s: %v", mode, err)
 			}
