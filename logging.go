@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/syslog"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -16,6 +17,8 @@ var openLocalSyslog = func() (*syslog.Writer, error) {
 }
 
 type serverLog struct {
+	mu     sync.Mutex // Serializes file writes with rotation reopen.
+	path   string
 	file   *os.File
 	syslog *syslog.Writer
 	logger *log.Logger
@@ -78,7 +81,7 @@ func openServerLog(o options) (*serverLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &serverLog{file: f}
+	l := &serverLog{path: o.logFile, file: f}
 	if o.syslog {
 		l.syslog, err = boundedLocalSyslog(o.timeout)
 		if err != nil {
@@ -100,7 +103,9 @@ func openServerLog(o options) (*serverLog, error) {
 
 func (l *serverLog) Write(b []byte) (int, error) {
 	// File writes stay synchronous. A slow syslog drops queued copies, never blocks WAL.
+	l.mu.Lock()
 	_, _ = l.file.Write(b)
+	l.mu.Unlock()
 	if l.queue != nil {
 		select {
 		case l.queue <- string(b): // Copy the logger's reusable buffer.
@@ -108,6 +113,22 @@ func (l *serverLog) Write(b []byte) (int, error) {
 		}
 	}
 	return len(b), nil
+}
+
+// reopen swaps the file descriptor after an external rotation. A record is
+// written entirely to one file; the old descriptor stays in use when opening
+// the replacement fails.
+func (l *serverLog) reopen() error {
+	f, err := openLogFile(l.path)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	old := l.file
+	l.file = f
+	l.mu.Unlock()
+	old.Close()
+	return nil
 }
 
 func (l *serverLog) Close() {

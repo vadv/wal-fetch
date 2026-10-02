@@ -240,6 +240,25 @@ func serve(o options) (serveErr error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
+	// Log rotation is external: after renaming the file, SIGUSR1 reopens it in
+	// place. The PID is in server.pid for the post-rotate hook.
+	rotate := make(chan os.Signal, 1)
+	signal.Notify(rotate, syscall.SIGUSR1)
+	defer signal.Stop(rotate)
+	go func() {
+		for {
+			select {
+			case <-rotate:
+				if e := logs.reopen(); e != nil {
+					s.logf("log reopen failed: %s", e)
+				} else {
+					s.logf("log file reopened")
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	s.logf("server started")
 	defer s.logf("server stopped")
 	if ready != nil {

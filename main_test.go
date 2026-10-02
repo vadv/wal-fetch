@@ -365,3 +365,33 @@ func TestPhysicalTransfer(t *testing.T) {
 		})
 	}
 }
+
+func captureStdout(t *testing.T, run func() error) string {
+	capture, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = capture
+	err = run()
+	capture.Close()
+	os.Stdout = stdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(capture.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func TestVersionFlag(t *testing.T) {
+	if out := captureStdout(t, func() error { return run([]string{"-version"}) }); !strings.Contains(out, "wal-fetch "+buildVersion) {
+		t.Fatalf("unexpected version output: %q", out)
+	}
+	// -version takes precedence over validating the remaining arguments.
+	if out := captureStdout(t, func() error { return run([]string{"-version", "-timeout", "0"}) }); !strings.Contains(out, "wal-fetch "+buildVersion) {
+		t.Fatalf("unexpected version output: %q", out)
+	}
+}
