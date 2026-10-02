@@ -8,10 +8,11 @@ permissions:
 jobs:
   recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        pg_version: [16, 18]
         segment_mb: [16, 1]
     defaults:
       run:
@@ -23,14 +24,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-      - name: Select preinstalled PostgreSQL 16
+      - name: Set up PostgreSQL ${{ matrix.pg_version }}
         run: |
           mkdir -p diagnostics
           test "$(id -u)" -ne 0
-          test -x /usr/lib/postgresql/16/bin/initdb
-          echo '/usr/lib/postgresql/16/bin' >> "$GITHUB_PATH"
-          /usr/lib/postgresql/16/bin/initdb --version | tee diagnostics/postgres-version.txt
-          grep -Eq 'PostgreSQL\) 16\.' diagnostics/postgres-version.txt
+          if ! test -x "/usr/lib/postgresql/${{ matrix.pg_version }}/bin/initdb"; then
+            sudo install -d /usr/share/postgresql-common/pgdg
+            sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "postgresql-${{ matrix.pg_version }}"
+          fi
+          test -x "/usr/lib/postgresql/${{ matrix.pg_version }}/bin/initdb"
+          echo "/usr/lib/postgresql/${{ matrix.pg_version }}/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/${{ matrix.pg_version }}/bin/initdb" --version | tee diagnostics/postgres-version.txt
+          grep -Eq "PostgreSQL\) ${{ matrix.pg_version }}\." diagnostics/postgres-version.txt
       - name: Install integration test dependencies
         id: pytest
         run: |
@@ -64,7 +72,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: recovery-pg16-${{ matrix.segment_mb }}MiB
+          name: recovery-pg${{ matrix.pg_version }}-${{ matrix.segment_mb }}MiB
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 7
