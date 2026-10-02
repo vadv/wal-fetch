@@ -22,6 +22,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// buildVersion can be set at build time with -ldflags "-X main.buildVersion=...".
+var buildVersion = "0.1"
+
 type options struct {
 	cfg              *pgconn.Config
 	dir, identity    string
@@ -58,11 +61,16 @@ func run(args []string) error {
 	fs.StringVar(&o.logFile, "log-file", "", "server log file (default PGDATA/.wal-fetch/server.log)")
 	fs.BoolVar(&o.syslog, "syslog", false, "also send server logs to local syslog")
 	help := fs.Bool("help", false, "show usage")
+	showVersion := fs.Bool("version", false, "print version")
 	if fs.Parse(args) != nil {
 		return errors.New("invalid arguments; use -help")
 	}
 	if *help {
-		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] [-slot-failure-limit 5] [-log-file PATH] [-syslog] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\n-slot-failure-limit 0 disables automatic slot suspension.\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
+		fmt.Fprintln(os.Stderr, "Usage: wal-fetch [-pgdata DIR] [-h HOST] [-p PORT] [-U USER] [-timeout 30s] [-idle-timeout 5m] [-wal-segment-size 16MB] [-no-slot] [-slot-failure-limit 5] [-log-file PATH] [-syslog] WAL_NAME DESTINATION\nServer: wal-fetch -serve [same options]\n-version prints the version and exits.\n-slot-failure-limit 0 disables automatic slot suspension.\nAuthentication: PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSSLMODE; no password argument.")
+		return nil
+	}
+	if *showVersion {
+		fmt.Fprintf(os.Stdout, "wal-fetch %s\n", buildVersion)
 		return nil
 	}
 	if o.timeout <= 0 || o.idle <= 0 || (!o.serve && fs.NArg() != 2) {

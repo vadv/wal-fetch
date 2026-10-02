@@ -103,6 +103,13 @@ func client(ctx context.Context, o options, name, dest string) error {
 			err = readJSON(r, &h)
 		}
 		if err == nil {
+			// A changed source stops the rejected server; one reconnect picks up
+			// its replacement started with the same configuration digest.
+			if !h.OK && h.Error == errSourceChanged.Error() && attempt == 0 {
+				c.Close()
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			break
 		}
 		c.Close()
@@ -240,6 +247,25 @@ func serve(o options) (serveErr error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
+	// Log rotation is external: after renaming the file, SIGUSR1 reopens it in
+	// place. The PID is in server.pid for the post-rotate hook.
+	rotate := make(chan os.Signal, 1)
+	signal.Notify(rotate, syscall.SIGUSR1)
+	defer signal.Stop(rotate)
+	go func() {
+		for {
+			select {
+			case <-rotate:
+				if e := logs.reopen(); e != nil {
+					s.logf("log reopen failed: %s", e)
+				} else {
+					s.logf("log file reopened")
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	s.logf("server started")
 	defer s.logf("server stopped")
 	if ready != nil {
@@ -266,6 +292,10 @@ func serve(o options) (serveErr error) {
 		}
 		s.handle(ctx, c)
 		c.Close()
+		if s.changed {
+			s.logf("source system or timeline changed; stopping server")
+			return nil
+		}
 	}
 }
 
@@ -345,6 +375,9 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 			s.lost()
 		}
 		fail(err)
+		if errors.Is(err, errSourceChanged) {
+			s.changed = true
+		}
 		return
 	}
 	// Always end COPY, including invalid/missing client ACKs. Do not advertise

@@ -160,6 +160,31 @@ def test_stale_socket(fx, source, closed, session):
     fx.result['stale_socket_concurrent_respawn'] = True
 
 
+def test_log_rotation(fx, source, closed, session):
+    scope = source['scope']
+    log = scope / '.wal-fetch/server.log'
+    pid = int((scope / '.wal-fetch/server.pid').read_text())
+    # Rename first, then signal; the server reopens the same path in place.
+    rotated = scope / '.wal-fetch/server.log.1'
+    log.rename(rotated)
+    os.kill(pid, signal.SIGUSR1)
+    wait_for(lambda: log.exists() and 'log file reopened' in log.read_text())
+    # Fetch a second, distinct segment: the session fixture already fetched
+    # `closed`, so its record legitimately predates the rotation.
+    fx.sql(source, 'CREATE TABLE wal_rotated AS SELECT generate_series(1,10000);')
+    after = fx.sql(source, 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());')
+    fx.sql(source, 'SELECT pg_switch_wal();')
+    fx.fetch(source, after, fx.run / 'rotated.wal')
+    # The server logs a completed fetch after the client's publication ACK, so
+    # the record can lag the client's exit; poll instead of reading once.
+    wait_for(lambda: f'fetched name={after}' in log.read_text())
+    fresh = log.read_text()
+    assert f'fetched name={after} bytes={fx.segment_mb << 20}' in fresh
+    assert f'fetched name={after}' not in rotated.read_text()
+    assert (log.stat().st_mode & 0o777) == 0o600
+    fx.result['sigusr1_reopens_log_without_restart'] = True
+
+
 @pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
 def test_idle_and_queue(fx, source, closed):
     # Idle never cancels active or queued work. Pause ONLY our private WAL sender.

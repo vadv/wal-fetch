@@ -151,3 +151,45 @@ func TestLogStartup(t *testing.T) {
 		}
 	}
 }
+
+func TestLogReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.log")
+	logs, err := openServerLog(options{logFile: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
+	logs.logger.Print("before rotation")
+	if err := os.Rename(path, filepath.Join(dir, "server.log.1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := logs.reopen(); err != nil {
+		t.Fatal(err)
+	}
+	logs.logger.Print("after rotation")
+	rotated, err := os.ReadFile(filepath.Join(dir, "server.log.1"))
+	if err != nil || !strings.Contains(string(rotated), "before rotation") || strings.Contains(string(rotated), "after rotation") {
+		t.Fatalf("rotation split records incorrectly: %q", rotated)
+	}
+	fresh, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(fresh), "after rotation") {
+		t.Fatalf("missing record after reopen: %q", fresh)
+	}
+	// A failed reopen keeps writing to the current descriptor.
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := logs.reopen(); err == nil {
+		t.Fatal("reopened onto a permissive file")
+	}
+	logs.logger.Print("after failed reopen")
+	rotated, err = os.ReadFile(filepath.Join(dir, "server.log.1"))
+	if err != nil || strings.Contains(string(rotated), "after failed reopen") {
+		t.Fatalf("records leaked past a failed reopen: %q", rotated)
+	}
+	fresh, err = os.ReadFile(path)
+	if err != nil || !strings.Contains(string(fresh), "after failed reopen") {
+		t.Fatalf("failed reopen lost the current descriptor: %q", fresh)
+	}
+}

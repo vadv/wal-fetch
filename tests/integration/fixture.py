@@ -39,6 +39,7 @@ class Fixture:
         root = Path(os.environ.get('WAL_FETCH_TEST_WORK', tempfile.gettempdir())).resolve()
         root.mkdir(parents=True, exist_ok=True)
         self.segment_mb = int(os.environ.get('WAL_FETCH_TEST_SEGMENT_MB', '16'))
+        self.pg_version = os.environ.get('WAL_FETCH_TEST_PG_VERSION', '16')
         self.no_slot = os.environ.get('WAL_FETCH_TEST_NO_SLOT', '0') == '1'
         self.run = Path(tempfile.mkdtemp(prefix='unix-it-', dir=root))
         (self.run / 's').mkdir()
@@ -129,8 +130,8 @@ class Fixture:
 
     def create_source(self):
         version = self.command(['initdb', '--version']).stdout.strip()
-        if not re.search(r'PostgreSQL\) 16\.', version):
-            raise RuntimeError('PostgreSQL 16 CLI tools must be on PATH')
+        if not re.search(rf'PostgreSQL\) {re.escape(self.pg_version)}\.', version):
+            raise RuntimeError(f'PostgreSQL {self.pg_version} CLI tools must be on PATH')
         self.result['postgres_version'] = version
         self.result['binary_sha256'] = hashlib.sha256(self.binary.read_bytes()).hexdigest()
         source_dir = self.run / 'source'

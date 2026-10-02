@@ -55,6 +55,7 @@ wal-fetch -no-slot -pgdata /var/lib/postgresql/data WAL_NAME DESTINATION
 | `-timeout` | `30s` | Request timeout, including queueing |
 | `-wal-segment-size` | `16MB` | Source segment size; override for a non-default cluster |
 | `-serve` | `false` | Run the server in the foreground |
+| `-version` | – | Print version and exit |
 
 Changing connection, slot or logging settings requires restarting the local server. Stop it with `kill -TERM "$(cat "$PGDATA/.wal-fetch/server.pid")"`; the next request starts it again.
 
@@ -70,11 +71,19 @@ restore_command = '/opt/wal-fetch -log-file /var/log/postgresql/wal-fetch.log -s
 
 The log directory must exist and be writable by the PostgreSQL OS user; the file must belong to that user with mode `0600`. Syslog uses tag `wal-fetch`, facility `daemon`; the host's syslog configuration controls its destination.
 
+Log rotation is external. Rename the file, then have the running server reopen it in place:
+
+```sh
+kill -USR1 "$(cat "$PGDATA/.wal-fetch/server.pid")"
+```
+
+The replacement must satisfy the same rules: a regular file owned by the same user with mode `0600`. A failed reopen keeps the old descriptor and is reported in the log.
+
 ## Limits
 
-Linux only. The server follows one fixed primary and timeline. Losing its connection also loses the temporary slot's WAL retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
+Linux only. The server follows one fixed primary and timeline. A source system or timeline change stops the server; the next request starts a new one against the new source. Losing its connection also loses the temporary slot's WAL retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
 
-Syslog requires a local receiver at startup. Delivery is best effort: a stalled receiver can lose syslog copies; file logging continues. Log rotation is external; restart the local server after renaming its log file.
+Syslog requires a local receiver at startup. Delivery is best effort: a stalled receiver can lose syslog copies; file logging continues. Log rotation is external: rename the file and send `SIGUSR1` to the PID in `server.pid`; no restart is required.
 
 ## Build and test
 
@@ -89,6 +98,8 @@ python -m pip install -r tests/integration/requirements.txt
 python -m pytest tests/integration -v
 WAL_FETCH_TEST_SEGMENT_MB=1 python -m pytest tests/integration -v
 ```
+
+Release builds set the version reported by `-version`: `go build -ldflags "-X main.buildVersion=v1.0.0" -o wal-fetch .`
 
 CI runs unit/race/vet checks and real recovery with 16 MiB and 1 MiB WAL segments, with and without a slot. It checks timeline history, recovery to the target checkpoint, slot lifecycle and failure handling.
 
