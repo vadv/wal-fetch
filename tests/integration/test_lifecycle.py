@@ -169,10 +169,15 @@ def test_log_rotation(fx, source, closed, session):
     log.rename(rotated)
     os.kill(pid, signal.SIGUSR1)
     wait_for(lambda: log.exists() and 'log file reopened' in log.read_text())
-    fx.fetch(source, closed, fx.run / 'rotated.wal')
+    # Fetch a second, distinct segment: the session fixture already fetched
+    # `closed`, so its record legitimately predates the rotation.
+    fx.sql(source, 'CREATE TABLE wal_rotated AS SELECT generate_series(1,10000);')
+    after = fx.sql(source, 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());')
+    fx.sql(source, 'SELECT pg_switch_wal();')
+    fx.fetch(source, after, fx.run / 'rotated.wal')
     fresh = log.read_text()
-    assert f'fetched name={closed} bytes={fx.segment_mb << 20}' in fresh
-    assert f'fetched name={closed}' not in rotated.read_text()
+    assert f'fetched name={after} bytes={fx.segment_mb << 20}' in fresh
+    assert f'fetched name={after}' not in rotated.read_text()
     assert (log.stat().st_mode & 0o777) == 0o600
     fx.result['sigusr1_reopens_log_without_restart'] = True
 
