@@ -175,6 +175,9 @@ def test_log_rotation(fx, source, closed, session):
     after = fx.sql(source, 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());')
     fx.sql(source, 'SELECT pg_switch_wal();')
     fx.fetch(source, after, fx.run / 'rotated.wal')
+    # The server logs a completed fetch after the client's publication ACK, so
+    # the record can lag the client's exit; poll instead of reading once.
+    wait_for(lambda: f'fetched name={after}' in log.read_text())
     fresh = log.read_text()
     assert f'fetched name={after} bytes={fx.segment_mb << 20}' in fresh
     assert f'fetched name={after}' not in rotated.read_text()
