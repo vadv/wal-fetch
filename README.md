@@ -81,7 +81,7 @@ The replacement must satisfy the same rules: a regular file owned by the same us
 
 ## Limits
 
-Linux only. The server follows one fixed primary and timeline. Losing its connection also loses the temporary slot's WAL retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
+Linux only. The server follows one fixed primary and timeline. A source system or timeline change stops the server; the next request starts a new one against the new source. Losing its connection also loses the temporary slot's WAL retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
 
 Syslog requires a local receiver at startup. Delivery is best effort: a stalled receiver can lose syslog copies; file logging continues. Log rotation is external: rename the file and send `SIGUSR1` to the PID in `server.pid`; no restart is required.
 

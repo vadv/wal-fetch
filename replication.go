@@ -20,6 +20,9 @@ type coverage struct {
 	tli        uint32
 }
 
+// errSourceChanged is fatal: the server follows one fixed source identity.
+var errSourceChanged = errors.New("source system or timeline changed; start a new server")
+
 // Only overlapping/adjacent published coverage advances retention; forget jumps.
 func (p coverage) published(tli uint32, start, end pglogrepl.LSN) coverage {
 	if start > p.end || end <= p.end || tli < p.tli {
@@ -43,6 +46,7 @@ type source struct {
 	streaming                        bool
 	failedWAL                        int
 	slotSuspended                    bool
+	changed                          bool // errSourceChanged stops the whole server
 	logger                           *log.Logger
 }
 
@@ -103,7 +107,7 @@ func (s *source) connect(ctx context.Context) (*pgconn.PgConn, error) {
 	}
 	if s.systemID != "" && (s.systemID != id.SystemID || s.timeline != uint32(id.Timeline)) {
 		_ = conn.Close(ctx)
-		return nil, errors.New("source system or timeline changed; start a new server")
+		return nil, errSourceChanged
 	}
 	if s.systemID == "" {
 		s.systemID = id.SystemID
@@ -173,7 +177,7 @@ func (s *source) fetch(ctx context.Context, req request, f *os.File) (candidate 
 	}
 	if id.SystemID != s.systemID || uint32(id.Timeline) != s.timeline {
 		s.lost()
-		return candidate, errors.New("source identity changed")
+		return candidate, errSourceChanged
 	}
 	var history []byte
 	if id.Timeline > 1 {

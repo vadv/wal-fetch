@@ -103,6 +103,13 @@ func client(ctx context.Context, o options, name, dest string) error {
 			err = readJSON(r, &h)
 		}
 		if err == nil {
+			// A changed source stops the rejected server; one reconnect picks up
+			// its replacement started with the same configuration digest.
+			if !h.OK && h.Error == errSourceChanged.Error() && attempt == 0 {
+				c.Close()
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			break
 		}
 		c.Close()
@@ -285,6 +292,10 @@ func serve(o options) (serveErr error) {
 		}
 		s.handle(ctx, c)
 		c.Close()
+		if s.changed {
+			s.logf("source system or timeline changed; stopping server")
+			return nil
+		}
 	}
 }
 
@@ -364,6 +375,9 @@ func (s *source) handle(parent context.Context, c *net.UnixConn) {
 			s.lost()
 		}
 		fail(err)
+		if errors.Is(err, errSourceChanged) {
+			s.changed = true
+		}
 		return
 	}
 	// Always end COPY, including invalid/missing client ACKs. Do not advertise
