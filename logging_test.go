@@ -177,18 +177,19 @@ func TestLogReopen(t *testing.T) {
 		t.Fatalf("missing record after reopen: %q", fresh)
 	}
 	// A failed reopen keeps writing to the current descriptor.
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(path, 0700); err != nil {
+	if err := os.Chmod(path, 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := logs.reopen(); err == nil {
-		t.Fatal("reopened onto a directory")
+		t.Fatal("reopened onto a permissive file")
 	}
 	logs.logger.Print("after failed reopen")
 	rotated, err = os.ReadFile(filepath.Join(dir, "server.log.1"))
-	if err != nil || !strings.Contains(string(rotated), "after failed reopen") {
-		t.Fatalf("failed reopen lost the old descriptor: %q", rotated)
+	if err != nil || strings.Contains(string(rotated), "after failed reopen") {
+		t.Fatalf("records leaked past a failed reopen: %q", rotated)
+	}
+	fresh, err = os.ReadFile(path)
+	if err != nil || !strings.Contains(string(fresh), "after failed reopen") {
+		t.Fatalf("failed reopen lost the current descriptor: %q", fresh)
 	}
 }
