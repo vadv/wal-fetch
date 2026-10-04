@@ -269,7 +269,7 @@ func connectLocal(ctx context.Context, o options) (*net.UnixConn, error) {
 			}
 		} else {
 			f.Close()
-			if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
 				return nil, errors.New("server lock failed")
 			}
 		}

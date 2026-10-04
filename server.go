@@ -115,7 +115,7 @@ func client(ctx context.Context, o options, name, dest string) error {
 		c.Close()
 		// An idle server may close just after Dial succeeded. No header means
 		// nothing was published, so one reconnect under the same deadline is safe.
-		if attempt != 0 || !(errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)) {
+		if attempt != 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE)) {
 			return errors.New("invalid server response")
 		}
 	}
@@ -281,7 +281,8 @@ func serve(o options) (serveErr error) {
 			if ctx.Err() != nil {
 				return nil
 			}
-			if ne, ok := e.(net.Error); ok && ne.Timeout() {
+			var ne net.Error
+			if errors.As(e, &ne) && ne.Timeout() {
 				return nil
 			}
 			return errors.New("Unix accept failed")

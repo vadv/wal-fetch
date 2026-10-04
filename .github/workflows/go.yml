@@ -51,6 +51,10 @@ jobs:
         run: CGO_ENABLED=1 go test -race -count=1 ./... 2>&1 | tee diagnostics/race.log
       - name: Vet
         run: go vet ./... 2>&1 | tee diagnostics/vet.log
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
       - name: Build static binary
         id: build
         run: CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o wal-fetch . 2>&1 | tee diagnostics/build.log
