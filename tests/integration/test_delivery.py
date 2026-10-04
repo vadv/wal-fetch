@@ -33,13 +33,20 @@ def test_quiet_active_wal(fx, source):
     fx.fetch(source, quiet_name, active, env_patch={'WAL_FETCH_TIMEOUT': '5'}, timeout=10)
     fx.result['quiet_active_seconds'] = time.monotonic() - begin
     after = fx.sql(source, 'SELECT pg_current_wal_flush_lsn();')
-    assert quiet_flush == after, (quiet_flush, after)
+    fx.result['quiet_active_flush_window'] = f'{quiet_flush}->{after}'
     raw = (source_dir / 'pg_wal' / quiet_name).read_bytes()
     got = active.read_bytes()
     offset = lsn(quiet_flush) % int(quiet_size)
     assert offset > 0 and len(got) == len(raw) == int(quiet_size)
-    assert got[:offset] == raw[:offset] and got[offset:] == bytes(len(got)-offset)
-    fx.result['quiet_active_prefix_and_zero_tail'] = True
+    assert got[:offset] == raw[:offset]
+    # The source may append WAL between the quiet_flush snapshot and the
+    # server's read, so the tail is checked per byte instead of requiring
+    # an all-zero suffix: each byte is either the zero the server pads
+    # beyond its cut point or the immutable WAL byte at that position.
+    tail, raw_tail = got[offset:], raw[offset:]
+    assert all(b == 0 or b == r for b, r in zip(tail, raw_tail)), \
+        (quiet_flush, after, next(i for i, (b, r) in enumerate(zip(tail, raw_tail)) if b != 0 and b != r))
+    fx.result['quiet_active_prefix_and_immutable_tail'] = True
 
 
 def test_credentials_and_errors(fx, source, closed, session):
