@@ -176,6 +176,6 @@ WAL_FETCH_TEST_SEGMENT_MB=1 python -m pytest tests/integration -v
 
 Release builds set the version reported by `-version`: `go build -ldflags "-X main.buildVersion=v1.0.0" -o wal-fetch .`
 
-CI runs unit/race/vet checks and real recovery with 16 MiB and 1 MiB WAL segments, with and without a slot. It checks timeline history, recovery to the target checkpoint, slot lifecycle and failure handling.
+CI runs unit/race/vet checks and real recovery with 16 MiB and 1 MiB WAL segments, with and without a slot. A separate job runs the same integration suite against a binary built with `-race`. It checks timeline history, recovery to the target checkpoint, slot lifecycle and failure handling.
 
 [MIT License](LICENSE). [Third-party licenses](THIRD_PARTY_NOTICES.txt).
