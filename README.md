@@ -4,6 +4,25 @@ Fetch WAL files and timeline history from a PostgreSQL primary for `restore_comm
 
 The first call starts a local Unix-socket server; subsequent calls reuse its PostgreSQL connection.
 
+## How it works
+
+Each `restore_command` invocation runs a short-lived **client**. The first client starts a detached **server** process — one per PGDATA — and later clients reuse it over a Unix socket. The server keeps one long-lived PostgreSQL connection and the temporary slot, so both survive between requests.
+
+**Startup.** The client dials `<pgdata>/.wal-fetch/server.sock`. When nothing answers, it takes an exclusive `flock` on `server.lock` and, as lock owner, starts the server as a detached session leader that inherits the lock; startup status returns through a pipe. The server exits after `-idle-timeout` of inactivity, and the lock passes to the next client.
+
+**Serial requests.** The server accepts one connection at a time and keeps no queue: concurrent `restore_command` calls wait in the kernel socket backlog and are handled one by one. The client sends its deadline with each request, and nothing is published when a request fails.
+
+**Wire protocol (version 1).** Newline-delimited JSON over one Unix-socket connection per request:
+
+1. Client → server: `{"version":1,"identity":"…","name":"000000010000000000000003","deadline":…}`.
+2. Server → client: `{"version":1,"ok":true,"length":16777216,"sha256":"…","id":"…"}`, followed by exactly `length` payload bytes; the server then half-closes its side.
+3. The client verifies length and SHA-256, writes the destination through a temporary file, `fsync`s it and renames it into place, then answers `{"version":1,"id":"…","published":true}`.
+4. Slot retention advances only after this acknowledgement.
+
+**Identity digest.** Every request carries a SHA-256 digest of the effective configuration: source connection settings (host, port, user, password, database, runtime parameters), SSL environment including digests of certificate files, and all behavioral options. Credentials never cross the socket; on a digest mismatch the server rejects the client with `source configuration mismatch` instead of mixing two configurations in one process.
+
+**WAL path.** For each segment the server runs `IDENTIFY_SYSTEM`, validates the requested timeline against the fetched timeline history, derives the exact LSN range from the filename and `-wal-segment-size`, and streams that range with `START_REPLICATION PHYSICAL`. Contiguity is enforced and the payload is truncated to the segment size, so an active segment ends in a zero-filled tail. Timeline history responses are capped at 1 MiB.
+
 ## Temporary slot
 
 Recovery can spend time replaying a file before requesting the next one. Meanwhile, the primary keeps generating WAL and may recycle files recovery still needs. By default, wal-fetch creates a temporary physical replication slot to retain WAL between calls.
@@ -59,6 +78,29 @@ wal-fetch -no-slot -pgdata /var/lib/postgresql/data WAL_NAME DESTINATION
 
 Changing connection, slot or logging settings requires restarting the local server. Stop it with `kill -TERM "$(cat "$PGDATA/.wal-fetch/server.pid")"`; the next request starts it again.
 
+Run the server in the foreground for debugging; it accepts the same options, without `WAL_NAME DESTINATION`:
+
+```sh
+wal-fetch -serve -pgdata /var/lib/postgresql/data
+```
+
+Print the version of the installed binary:
+
+```sh
+wal-fetch -version
+```
+
+## Security
+
+All server state lives in `<pgdata>/.wal-fetch`, created with mode `0700` and owned by the PostgreSQL OS user: `server.sock` (`0600`), `server.lock`, `server.pid` and `server.log`.
+
+- **Peer identity** — both sides check the Unix-socket peer with `SO_PEERCRED` and drop connections from a different OS UID.
+- **File safety** — the lock and log files are opened with `O_NOFOLLOW` and must be regular files owned by the same UID with mode `0600`; the socket directory itself must be a directory owned by that UID with mode `0700`.
+- **No secrets on the wire** — the socket carries filenames, digests and file bytes only; connection settings travel solely inside the identity digest.
+- **Atomic publication** — the destination appears by `rename` after `fsync`, so PostgreSQL never observes a partial segment or history file; a failed request leaves the destination unchanged.
+- **One fixed source** — multi-host connection strings are rejected, and the server pins the first system identifier and timeline it sees, stopping on any change.
+- **Crash hygiene** — leftover staging files are removed at startup by the lock owner; nothing from a previous run is reused.
+
 ## Logs
 
 Server events go to `<pgdata>/.wal-fetch/server.log` by default: startup/shutdown, slot lifecycle and file requests. Client errors go to stderr, which PostgreSQL captures when running `restore_command`.
@@ -78,6 +120,27 @@ kill -USR1 "$(cat "$PGDATA/.wal-fetch/server.pid")"
 ```
 
 The replacement must satisfy the same rules: a regular file owned by the same user with mode `0600`. A failed reopen keeps the old descriptor and is reported in the log.
+
+## Troubleshooting
+
+Client errors go to stderr with the `wal-fetch:` prefix, which PostgreSQL captures for `restore_command`. Server-side rejections surface as `server rejected request: …` on the client and appear in `server.log` as `rejected error=…`.
+
+| Message | Cause | Action |
+|---|---|---|
+| `source configuration mismatch` | Client settings differ from the running server's | Restart the server (see Usage), then retry |
+| `socket peer UID mismatch` | Socket peer runs as another OS user | One OS user owns `$PGDATA`; check who started the other server |
+| `source system or timeline changed; start a new server` | The primary was reinitialized or moved to a new timeline | The server stops itself; the next request starts a new one |
+| `server startup failed` | The freshly started server failed | Read `server.log` |
+| `PGDATA path is too long for Unix socket` | Path over the 108-character Unix-socket limit | Use a shorter PGDATA |
+| `server already running` | Foreground `-serve` while another server owns the lock | Use the running server, or stop it first |
+
+Inspect the temporary slot from SQL; it disappears when its owning server exits, which is expected after `-idle-timeout` or `kill -TERM`:
+
+```sql
+SELECT slot_name, active, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name LIKE 'wal_fetch_%';
+```
 
 ## Limits
 
