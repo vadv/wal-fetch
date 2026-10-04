@@ -4,24 +4,36 @@ Fetch WAL files and timeline history from a PostgreSQL primary for `restore_comm
 
 The first call starts a local Unix-socket server; subsequent calls reuse its PostgreSQL connection.
 
+[Русская версия](README.ru.md)
+
 ## How it works
 
-Each `restore_command` invocation runs a short-lived **client**. The first client starts a detached **server** process — one per PGDATA — and later clients reuse it over a Unix socket. The server keeps one long-lived PostgreSQL connection and the temporary slot, so both survive between requests.
+Each `restore_command` invocation runs a short-lived client. The first client starts a detached server process, one per PGDATA, and later clients connect to it over a Unix socket. The server keeps one long-lived PostgreSQL connection and the temporary slot between requests.
 
-**Startup.** The client dials `<pgdata>/.wal-fetch/server.sock`. When nothing answers, it takes an exclusive `flock` on `server.lock` and, as lock owner, starts the server as a detached session leader that inherits the lock; startup status returns through a pipe. The server exits after `-idle-timeout` of inactivity, and the lock passes to the next client.
+### Startup
 
-**Serial requests.** The server accepts one connection at a time and keeps no queue: concurrent `restore_command` calls wait in the kernel socket backlog and are handled one by one. The client sends its deadline with each request, and nothing is published when a request fails.
+The client dials `<pgdata>/.wal-fetch/server.sock`. If nothing answers, it takes an exclusive `flock` on `server.lock` and, as lock owner, starts the server as a detached session leader that inherits the lock. Startup status returns through a pipe. The server exits after `-idle-timeout` of inactivity, and the lock passes to the next client.
 
-**Wire protocol (version 1).** Newline-delimited JSON over one Unix-socket connection per request:
+### Request handling
 
-1. Client → server: `{"version":1,"identity":"…","name":"000000010000000000000003","deadline":…}`.
-2. Server → client: `{"version":1,"ok":true,"length":16777216,"sha256":"…","id":"…"}`, followed by exactly `length` payload bytes; the server then half-closes its side.
-3. The client verifies length and SHA-256, writes the destination through a temporary file, `fsync`s it and renames it into place, then answers `{"version":1,"id":"…","published":true}`.
+The server accepts one connection at a time and keeps no queue: concurrent `restore_command` calls wait in the kernel socket backlog and are handled one by one. The client sends its deadline with each request. Nothing is published when a request fails.
+
+### Protocol (version 1)
+
+Newline-delimited JSON over one Unix-socket connection per request:
+
+1. The client sends `{"version":1,"identity":"…","name":"000000010000000000000003","deadline":…}`.
+2. The server replies `{"version":1,"ok":true,"length":16777216,"sha256":"…","id":"…"}`, followed by exactly `length` payload bytes, then half-closes its side.
+3. The client verifies length and SHA-256, writes the destination through a temporary file, calls `fsync` on it, renames it into place and answers `{"version":1,"id":"…","published":true}`.
 4. Slot retention advances only after this acknowledgement.
 
-**Identity digest.** Every request carries a SHA-256 digest of the effective configuration: source connection settings (host, port, user, password, database, runtime parameters), SSL environment including digests of certificate files, and all behavioral options. Credentials never cross the socket; on a digest mismatch the server rejects the client with `source configuration mismatch` instead of mixing two configurations in one process.
+### Identity digest
 
-**WAL path.** For each segment the server runs `IDENTIFY_SYSTEM`, validates the requested timeline against the fetched timeline history, derives the exact LSN range from the filename and `-wal-segment-size`, and streams that range with `START_REPLICATION PHYSICAL`. Contiguity is enforced and the payload is truncated to the segment size, so an active segment ends in a zero-filled tail. Timeline history responses are capped at 1 MiB.
+Every request carries a SHA-256 digest of the effective configuration: source connection settings (host, port, user, password, database, runtime parameters), SSL environment including digests of certificate files, and all behavioral options. Credentials never cross the socket. On a digest mismatch the server rejects the client with `source configuration mismatch` instead of mixing two configurations in one process.
+
+### WAL path
+
+For each segment the server runs `IDENTIFY_SYSTEM`, validates the requested timeline against the fetched timeline history, derives the exact LSN range from the filename and `-wal-segment-size`, and streams that range with `START_REPLICATION PHYSICAL`. Contiguity is enforced and the payload is truncated to the segment size, so an active segment ends in a zero-filled tail. Timeline history responses are capped at 1 MiB.
 
 ## Temporary slot
 
@@ -74,7 +86,7 @@ wal-fetch -no-slot -pgdata /var/lib/postgresql/data WAL_NAME DESTINATION
 | `-timeout` | `30s` | Request timeout, including queueing |
 | `-wal-segment-size` | `16MB` | Source segment size; override for a non-default cluster |
 | `-serve` | `false` | Run the server in the foreground |
-| `-version` | – | Print version and exit |
+| `-version` | none | Print version and exit |
 
 Changing connection, slot or logging settings requires restarting the local server. Stop it with `kill -TERM "$(cat "$PGDATA/.wal-fetch/server.pid")"`; the next request starts it again.
 
@@ -92,14 +104,14 @@ wal-fetch -version
 
 ## Security
 
-All server state lives in `<pgdata>/.wal-fetch`, created with mode `0700` and owned by the PostgreSQL OS user: `server.sock` (`0600`), `server.lock`, `server.pid` and `server.log`.
+All server state is kept in `<pgdata>/.wal-fetch`, created with mode `0700` and owned by the PostgreSQL OS user: `server.sock` (`0600`), `server.lock`, `server.pid` and `server.log`.
 
-- **Peer identity** — both sides check the Unix-socket peer with `SO_PEERCRED` and drop connections from a different OS UID.
-- **File safety** — the lock and log files are opened with `O_NOFOLLOW` and must be regular files owned by the same UID with mode `0600`; the socket directory itself must be a directory owned by that UID with mode `0700`.
-- **No secrets on the wire** — the socket carries filenames, digests and file bytes only; connection settings travel solely inside the identity digest.
-- **Atomic publication** — the destination appears by `rename` after `fsync`, so PostgreSQL never observes a partial segment or history file; a failed request leaves the destination unchanged.
-- **One fixed source** — multi-host connection strings are rejected, and the server pins the first system identifier and timeline it sees, stopping on any change.
-- **Crash hygiene** — leftover staging files are removed at startup by the lock owner; nothing from a previous run is reused.
+- Both sides check the Unix-socket peer with `SO_PEERCRED` and drop connections from a different OS UID.
+- The lock and log files are opened with `O_NOFOLLOW` and must be regular files owned by the same UID with mode `0600`. The socket directory must be owned by that UID with mode `0700`.
+- The socket carries filenames, digests and file bytes only; connection settings travel only inside the identity digest.
+- The destination appears by `rename` after `fsync`, so PostgreSQL never observes a partial segment or history file. A failed request leaves the destination unchanged.
+- Multi-host connection strings are rejected. The server pins the first system identifier and timeline it sees and stops on any change.
+- Leftover staging files are removed at startup by the lock owner. Nothing from a previous run is reused.
 
 ## Logs
 
