@@ -13,23 +13,21 @@ linters:
     - unparam
   settings:
     errcheck:
-      # Best-effort cleanup: closing a descriptor after use, removing a lock or
-      # staging file, and printing a version banner all ignore errors on purpose.
+      # Best-effort cleanup: closing a descriptor after use and removing a lock or
+      # staging file. Sites that ignore an error on purpose write `_ = ...` instead.
       exclude-functions:
         - (*os.File).Close
-        # Close is promoted from the unexported net.conn interface, so the
-        # exclude entry must use its types.Func.FullName() form.
-        - (*net.conn).Close
-        - (*net.UnixListener).Close
         # Interface-typed calls exclude by the interface method's full name.
+        # Unix socket types promote Close from the unexported net.conn, so they
+        # need both the interface name and the declaring type's name.
         - (net.Conn).Close
         - (net.Listener).Close
+        - (*net.conn).Close
+        - (*net.UnixListener).Close
         - (*github.com/jackc/pgx/v5/pgconn.PgConn).Close
         - (*log/syslog.Writer).Close
         - os.Remove
         - os.RemoveAll
-        - fmt.Fprintf
-        - fmt.Fprintln
     staticcheck:
       # "Unix" in "Unix accept failed" is a proper noun.
       checks: [all, -ST1005]
