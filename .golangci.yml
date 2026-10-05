@@ -1,0 +1,37 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - copyloopvar
+    - errorlint
+    - misspell
+    - unconvert
+    - unparam
+  settings:
+    errcheck:
+      # Best-effort cleanup: closing a descriptor after use and removing a lock or
+      # staging file. Sites that ignore an error on purpose write `_ = ...` instead.
+      exclude-functions:
+        - (*os.File).Close
+        # Interface-typed calls exclude by the interface method's full name.
+        # Unix socket types promote Close from the unexported net.conn, so they
+        # need both the interface name and the declaring type's name.
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*net.conn).Close
+        - (*net.UnixListener).Close
+        - (*github.com/jackc/pgx/v5/pgconn.PgConn).Close
+        - (*log/syslog.Writer).Close
+        - os.Remove
+        - os.RemoveAll
+    staticcheck:
+      # "Unix" in "Unix accept failed" is a proper noun.
+      checks: [all, -ST1005]
+
+formatters:
+  enable:
+    - gofmt

@@ -8,10 +8,11 @@ permissions:
 jobs:
   recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        pg_version: [16, 18]
         segment_mb: [16, 1]
     defaults:
       run:
@@ -23,14 +24,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-      - name: Select preinstalled PostgreSQL 16
-        run: |
-          mkdir -p diagnostics
-          test "$(id -u)" -ne 0
-          test -x /usr/lib/postgresql/16/bin/initdb
-          echo '/usr/lib/postgresql/16/bin' >> "$GITHUB_PATH"
-          /usr/lib/postgresql/16/bin/initdb --version | tee diagnostics/postgres-version.txt
-          grep -Eq 'PostgreSQL\) 16\.' diagnostics/postgres-version.txt
+      - name: Set up PostgreSQL ${{ matrix.pg_version }}
+        uses: ./.github/actions/pg-setup
+        with:
+          pg_version: ${{ matrix.pg_version }}
       - name: Install integration test dependencies
         id: pytest
         run: |
@@ -43,12 +40,17 @@ jobs:
         run: CGO_ENABLED=1 go test -race -count=1 ./... 2>&1 | tee diagnostics/race.log
       - name: Vet
         run: go vet ./... 2>&1 | tee diagnostics/vet.log
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
       - name: Build static binary
         id: build
-        run: CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o wal-fetch . 2>&1 | tee diagnostics/build.log
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=$(git describe --tags --always --dirty)" -o wal-fetch . 2>&1 | tee diagnostics/build.log
       - name: PostgreSQL recovery and slot lifecycle
         env:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
+          WAL_FETCH_TEST_PG_VERSION: ${{ matrix.pg_version }}
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
         run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration.log
@@ -56,6 +58,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.pytest.outcome == 'success' }}
         env:
           WAL_FETCH_TEST_SEGMENT_MB: ${{ matrix.segment_mb }}
+          WAL_FETCH_TEST_PG_VERSION: ${{ matrix.pg_version }}
           WAL_FETCH_TEST_NO_SLOT: '1'
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
@@ -64,7 +67,60 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: recovery-pg16-${{ matrix.segment_mb }}MiB
+          name: recovery-pg${{ matrix.pg_version }}-${{ matrix.segment_mb }}MiB
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      # One fixed source version is enough here: the recovery matrix covers versions,
+      # this job covers the binary built with -race.
+      - name: Set up PostgreSQL 16
+        uses: ./.github/actions/pg-setup
+        with:
+          pg_version: '16'
+      - name: Install integration test dependencies
+        run: |
+          python3 -m venv tests/integration/.venv
+          tests/integration/.venv/bin/python -m pip install -r tests/integration/requirements.txt
+          echo "$GITHUB_WORKSPACE/tests/integration/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build race-enabled binary
+        id: build
+        run: CGO_ENABLED=1 go build -race -trimpath -o wal-fetch . 2>&1 | tee diagnostics/build.log
+      - name: PostgreSQL recovery with race-enabled binary
+        id: pytest
+        env:
+          WAL_FETCH_TEST_SEGMENT_MB: '16'
+          WAL_FETCH_TEST_PG_VERSION: '16'
+          WAL_FETCH_TEST_WORK: /tmp
+          WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
+        run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration-race.log
+      - name: PostgreSQL recovery without slots
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.pytest.outcome == 'success' }}
+        env:
+          WAL_FETCH_TEST_SEGMENT_MB: '16'
+          WAL_FETCH_TEST_PG_VERSION: '16'
+          WAL_FETCH_TEST_NO_SLOT: '1'
+          WAL_FETCH_TEST_WORK: /tmp
+          WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
+        run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration-race-no-slot.log
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-race
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 7

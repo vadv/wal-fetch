@@ -160,11 +160,42 @@ def test_stale_socket(fx, source, closed, session):
     fx.result['stale_socket_concurrent_respawn'] = True
 
 
+def test_log_rotation(fx, source, closed, session):
+    scope = source['scope']
+    log = scope / '.wal-fetch/server.log'
+    pid = int((scope / '.wal-fetch/server.pid').read_text())
+    # Rename first, then signal; the server reopens the same path in place.
+    rotated = scope / '.wal-fetch/server.log.1'
+    log.rename(rotated)
+    os.kill(pid, signal.SIGUSR1)
+    wait_for(lambda: log.exists() and 'log file reopened' in log.read_text())
+    # Fetch a second, distinct segment: the session fixture already fetched
+    # `closed`, so its record legitimately predates the rotation.
+    fx.sql(source, 'CREATE TABLE wal_rotated AS SELECT generate_series(1,10000);')
+    after = fx.sql(source, 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());')
+    fx.sql(source, 'SELECT pg_switch_wal();')
+    fx.fetch(source, after, fx.run / 'rotated.wal')
+    # The server logs a completed fetch after the client's publication ACK, so
+    # the record can lag the client's exit; poll instead of reading once.
+    wait_for(lambda: f'fetched name={after}' in log.read_text())
+    fresh = log.read_text()
+    assert f'fetched name={after} bytes={fx.segment_mb << 20}' in fresh
+    assert f'fetched name={after}' not in rotated.read_text()
+    assert (log.stat().st_mode & 0o777) == 0o600
+    fx.result['sigusr1_reopens_log_without_restart'] = True
+
+
 @pytest.mark.skipif(os.environ.get('WAL_FETCH_TEST_NO_SLOT') == '1', reason='requires a TEMP slot')
 def test_idle_and_queue(fx, source, closed):
     # Idle never cancels active or queued work. Pause ONLY our private WAL sender.
+    # The idle window must outlast the client's post-transfer finalization: a
+    # slower binary (for example one built with -race) otherwise lets the
+    # server exit and remove server.pid before the client process returns.
+    # The window participates in the client/server identity hash, so every
+    # fetch in this test uses the same value; the pause below stays longer
+    # than the window so the no-cancellation property is still exercised.
     idle_scope = fx.new_scope('idle-client')
-    fx.fetch(source, closed, fx.run / 'idle-warm', scope=idle_scope, idle='300ms')
+    fx.fetch(source, closed, fx.run / 'idle-warm', scope=idle_scope, idle='2s')
     idle_pid = int((idle_scope / '.wal-fetch/server.pid').read_text())
     idle_slot, row = slot_state(fx, source, idle_scope)
     backend = int(row.split('|')[0])
@@ -172,8 +203,8 @@ def test_idle_and_queue(fx, source, closed):
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             jobs = [pool.submit(fx.fetch, source, closed, fx.run / f'idle-active-{i}',
-                                scope=idle_scope, idle='300ms') for i in range(2)]
-            time.sleep(0.8)
+                                scope=idle_scope, idle='2s') for i in range(2)]
+            time.sleep(3)
             assert (idle_scope / '.wal-fetch/server.sock').exists()
             os.kill(backend, signal.SIGCONT)
             for job in jobs:
@@ -186,7 +217,7 @@ def test_idle_and_queue(fx, source, closed):
     wait_for(lambda: not (idle_scope / '.wal-fetch/server.sock').exists())
     # Closing the connection precedes PostgreSQL processing its disconnect.
     wait_for(lambda: fx.sql(source, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name='{idle_slot}'") == '0')
-    fx.fetch(source, closed, fx.run / 'idle-respawn', scope=idle_scope, idle='300ms')
+    fx.fetch(source, closed, fx.run / 'idle-respawn', scope=idle_scope, idle='2s')
     assert int((idle_scope / '.wal-fetch/server.pid').read_text()) != idle_pid
     fx.result['idle_active_queue_cleanup_and_autorespawn'] = True
 

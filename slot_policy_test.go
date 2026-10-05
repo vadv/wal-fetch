@@ -83,7 +83,7 @@ func TestSlotPolicyCopyDone(t *testing.T) {
 				}
 				msg, err := b.Receive()
 				if _, ok := msg.(*pgproto3.CopyDone); err != nil || !ok {
-					done <- fmt.Errorf("expected CopyDone, got %T: %v", msg, err)
+					done <- fmt.Errorf("expected CopyDone, got %T: %w", msg, err)
 					return
 				}
 				if tc.fail {
@@ -99,7 +99,7 @@ func TestSlotPolicyCopyDone(t *testing.T) {
 				}
 				msg, err = b.Receive()
 				if _, ok := msg.(*pgproto3.Terminate); err != nil || !ok {
-					done <- fmt.Errorf("expected Terminate, got %T: %v", msg, err)
+					done <- fmt.Errorf("expected Terminate, got %T: %w", msg, err)
 					return
 				}
 				done <- nil

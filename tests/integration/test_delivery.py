@@ -33,13 +33,20 @@ def test_quiet_active_wal(fx, source):
     fx.fetch(source, quiet_name, active, env_patch={'WAL_FETCH_TIMEOUT': '5'}, timeout=10)
     fx.result['quiet_active_seconds'] = time.monotonic() - begin
     after = fx.sql(source, 'SELECT pg_current_wal_flush_lsn();')
-    assert quiet_flush == after, (quiet_flush, after)
+    fx.result['quiet_active_flush_window'] = f'{quiet_flush}->{after}'
     raw = (source_dir / 'pg_wal' / quiet_name).read_bytes()
     got = active.read_bytes()
     offset = lsn(quiet_flush) % int(quiet_size)
     assert offset > 0 and len(got) == len(raw) == int(quiet_size)
-    assert got[:offset] == raw[:offset] and got[offset:] == bytes(len(got)-offset)
+    assert got[:offset] == raw[:offset]
+    # The delivered file is a prefix of the segment as the source had it, padded
+    # with zeros beyond the point the server read. WAL bytes already written are
+    # immutable, so the first mismatch is the server's cut point: it may be later
+    # than quiet_flush because the source kept generating WAL during the fetch.
+    cut = next((i for i in range(offset, len(got)) if got[i] != raw[i]), len(got))
+    assert all(b == 0 for b in got[cut:]), (quiet_flush, after, cut)
     fx.result['quiet_active_prefix_and_zero_tail'] = True
+    fx.result['quiet_active_cut_offset'] = cut
 
 
 def test_credentials_and_errors(fx, source, closed, session):
