@@ -1,0 +1,27 @@
+name: PostgreSQL setup
+description: Install and verify the PostgreSQL CLI tools used by the integration tests.
+
+inputs:
+  pg_version:
+    description: Major version of the PostgreSQL CLI tools
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install PostgreSQL ${{ inputs.pg_version }}
+      shell: bash
+      run: |
+        mkdir -p diagnostics
+        test "$(id -u)" -ne 0
+        if ! test -x "/usr/lib/postgresql/${{ inputs.pg_version }}/bin/initdb"; then
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "postgresql-${{ inputs.pg_version }}"
+        fi
+        test -x "/usr/lib/postgresql/${{ inputs.pg_version }}/bin/initdb"
+        echo "/usr/lib/postgresql/${{ inputs.pg_version }}/bin" >> "$GITHUB_PATH"
+        "/usr/lib/postgresql/${{ inputs.pg_version }}/bin/initdb" --version | tee diagnostics/postgres-version.txt
+        grep -Eq "PostgreSQL\) ${{ inputs.pg_version }}\." diagnostics/postgres-version.txt
