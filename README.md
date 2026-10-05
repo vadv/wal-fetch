@@ -131,7 +131,25 @@ Log rotation is external. Rename the file, then have the running server reopen i
 kill -USR1 "$(cat "$PGDATA/.wal-fetch/server.pid")"
 ```
 
-The replacement must satisfy the same rules: a regular file owned by the same user with mode `0600`. A failed reopen keeps the old descriptor and is reported in the log.
+The replacement must satisfy the same rules: a regular file owned by the same user with mode `0600`, so logrotate needs `create 0600 postgres postgres`. A failed reopen keeps the old descriptor and is reported in the log.
+
+```conf
+/var/log/postgresql/wal-fetch.log {
+    daily
+    rotate 14
+    create 0600 postgres postgres
+    postrotate
+        pid=/var/lib/postgresql/data/.wal-fetch/server.pid
+        if [ -f "$pid" ] && kill -0 "$(cat "$pid")" 2>/dev/null; then
+            kill -USR1 "$(cat "$pid")"
+        fi
+    endpostrotate
+}
+```
+
+Check that the PID is alive before signalling. `server.pid` belongs to the running server and is removed when it exits, and a stale PID can already belong to another process. When no server is running the hook does nothing: the next request starts one that opens the new file.
+
+`copytruncate` works without a signal because the server keeps writing to the same descriptor, but rename plus `SIGUSR1` is the supported path. Output inherited by the server at startup — stdout and stderr, used for startup failures and panics — continues to go to the rotated file.
 
 ## Troubleshooting
 
@@ -162,7 +180,7 @@ Syslog requires a local receiver at startup. Delivery is best effort: a stalled 
 
 ## Build and test
 
-Linux, Go 1.25. Recovery tests require Python 3, PostgreSQL 16 tools on `PATH` and a non-root user.
+Linux, Go 1.25. Recovery tests require Python 3, PostgreSQL 16 or 18 tools on `PATH` and a non-root user.
 
 ```sh
 go build -o wal-fetch .
@@ -174,7 +192,7 @@ python -m pytest tests/integration -v
 WAL_FETCH_TEST_SEGMENT_MB=1 python -m pytest tests/integration -v
 ```
 
-Release builds set the version reported by `-version`: `go build -ldflags "-X main.buildVersion=v1.0.0" -o wal-fetch .`
+Release builds set the version reported by `-version`: `go build -ldflags "-X main.buildVersion=v1.0.0" -o wal-fetch .` A build from source reports `dev`.
 
 CI runs unit/race/vet checks and real recovery with 16 MiB and 1 MiB WAL segments, with and without a slot. A separate job runs the same integration suite against a binary built with `-race`. It checks timeline history, recovery to the target checkpoint, slot lifecycle and failure handling.
 
