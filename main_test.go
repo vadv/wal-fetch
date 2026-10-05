@@ -113,6 +113,33 @@ func TestServerRejectsBeforeConnecting(t *testing.T) {
 		}
 	}
 }
+func TestServerStartupFailure(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"server.lock", "cannot open server lock"},
+		{"server.sock", "refusing to replace non-socket"},
+		{"server.pid", "cannot write server PID"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, tc.path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- serve(options{dir: dir, logFile: filepath.Join(dir, "server.log")})
+			}()
+			select {
+			case err := <-done:
+				if err == nil || err.Error() != tc.want {
+					t.Fatalf("expected %q, got %v", tc.want, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not return its startup error")
+			}
+		})
+	}
+}
+
 func TestClientPublication(t *testing.T) {
 	for _, mode := range []string{"complete", "ack-lost", "version", "length", "truncated", "extra", "digest", "id", "retry-close", "source-changed", "timeout", "malformed"} {
 		t.Run(mode, func(t *testing.T) {
