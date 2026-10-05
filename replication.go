@@ -20,8 +20,13 @@ type coverage struct {
 	tli        uint32
 }
 
+// codeSourceChanged is the wire code the client recognizes as "stop talking to
+// this server and start a replacement". It is part of the protocol contract, so
+// the wording must not change; the client compares it against the error field.
+const codeSourceChanged = "source system or timeline changed; start a new server"
+
 // errSourceChanged is fatal: the server follows one fixed source identity.
-var errSourceChanged = errors.New("source system or timeline changed; start a new server")
+var errSourceChanged = errors.New(codeSourceChanged)
 
 // Only overlapping/adjacent published coverage advances retention; forget jumps.
 func (p coverage) published(tli uint32, start, end pglogrepl.LSN) coverage {
