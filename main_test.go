@@ -391,10 +391,11 @@ func captureStdout(t *testing.T, run func() error) string {
 	}
 	stdout := os.Stdout
 	os.Stdout = capture
-	err = run()
-	capture.Close()
-	os.Stdout = stdout
-	if err != nil {
+	t.Cleanup(func() { os.Stdout = stdout })
+	if err := run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Close(); err != nil {
 		t.Fatal(err)
 	}
 	out, err := os.ReadFile(capture.Name())
