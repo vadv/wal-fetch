@@ -17,9 +17,10 @@ var openLocalSyslog = func() (*syslog.Writer, error) {
 }
 
 type serverLog struct {
-	mu     sync.Mutex // Serializes file writes with rotation reopen.
+	mu     sync.Mutex // Serializes file writes with rotation reopen and Close.
 	path   string
 	file   *os.File
+	closed bool
 	syslog *syslog.Writer
 	logger *log.Logger
 	queue  chan string
@@ -104,7 +105,9 @@ func openServerLog(o options) (*serverLog, error) {
 func (l *serverLog) Write(b []byte) (int, error) {
 	// File writes stay synchronous. A slow syslog drops queued copies, never blocks WAL.
 	l.mu.Lock()
-	_, _ = l.file.Write(b)
+	if !l.closed {
+		_, _ = l.file.Write(b)
+	}
 	l.mu.Unlock()
 	if l.queue != nil {
 		select {
@@ -117,25 +120,37 @@ func (l *serverLog) Write(b []byte) (int, error) {
 
 // reopen swaps the file descriptor after an external rotation. A record is
 // written entirely to one file; the old descriptor stays in use when opening
-// the replacement fails.
+// the replacement fails. Reopening a closed log does nothing: Close is the end
+// of the descriptor's lifetime.
 func (l *serverLog) reopen() error {
 	f, err := openLogFile(l.path)
 	if err != nil {
 		return err
 	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		f.Close()
+		return errors.New("server log is closed")
+	}
 	old := l.file
 	l.file = f
-	l.mu.Unlock()
 	old.Close()
 	return nil
 }
 
 func (l *serverLog) Close() {
-	// Called after the server's serial log use. Never wait for syslog's mutex.
+	// Never wait for syslog's mutex. The rotation handler is stopped before
+	// Close, and the mutex still covers a reopen that was already in flight.
 	if l.queue != nil {
 		close(l.queue)
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	l.closed = true
 	l.file.Close()
 }
 

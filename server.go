@@ -105,7 +105,7 @@ func client(ctx context.Context, o options, name, dest string) error {
 		if err == nil {
 			// A changed source stops the rejected server; one reconnect picks up
 			// its replacement started with the same configuration digest.
-			if !h.OK && h.Error == errSourceChanged.Error() && attempt == 0 {
+			if !h.OK && h.Error == codeSourceChanged && attempt == 0 {
 				c.Close()
 				time.Sleep(50 * time.Millisecond)
 				continue
@@ -181,7 +181,7 @@ func serve(o options) (serveErr error) {
 		ready = os.NewFile(4, "server.ready")
 		defer func() {
 			if serveErr != nil {
-				fmt.Fprintln(ready, safeLocalMessage(serveErr.Error()))
+				_, _ = fmt.Fprintln(ready, safeLocalMessage(serveErr.Error()))
 			}
 			ready.Close()
 		}()
@@ -190,7 +190,13 @@ func serve(o options) (serveErr error) {
 	if err != nil {
 		return err
 	}
-	defer logs.Close()
+	// A rotation signal in flight must finish before the log closes, so no
+	// record is written to or swapped onto a closed descriptor.
+	rotation := make(chan struct{})
+	defer func() {
+		<-rotation
+		logs.Close()
+	}()
 	var lock *os.File
 	if os.Getenv("WAL_FETCH_INHERITED_LOCK") == "1" {
 		lock = os.NewFile(3, "server.lock")
@@ -247,24 +253,14 @@ func serve(o options) (serveErr error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
-	// Log rotation is external: after renaming the file, SIGUSR1 reopens it in
-	// place. The PID is in server.pid for the post-rotate hook.
+	// Log rotation is external: after renaming the file, the post-rotate hook
+	// signals the PID in server.pid.
 	rotate := make(chan os.Signal, 1)
 	signal.Notify(rotate, syscall.SIGUSR1)
 	defer signal.Stop(rotate)
 	go func() {
-		for {
-			select {
-			case <-rotate:
-				if e := logs.reopen(); e != nil {
-					s.logf("log reopen failed: %s", e)
-				} else {
-					s.logf("log file reopened")
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
+		defer close(rotation)
+		rotationHandler(ctx, rotate, logs, s.logf)
 	}()
 	s.logf("server started")
 	defer s.logf("server stopped")
@@ -296,6 +292,25 @@ func serve(o options) (serveErr error) {
 		if s.changed {
 			s.logf("source system or timeline changed; stopping server")
 			return nil
+		}
+	}
+}
+
+// rotationHandler reopens the log on every signal until ctx is done. Log rotation
+// is external: after renaming the file, the post-rotate hook signals the PID in
+// server.pid. The handler returns when ctx is cancelled, which happens before the
+// log is closed.
+func rotationHandler(ctx context.Context, sig <-chan os.Signal, logs *serverLog, logf func(format string, args ...any)) {
+	for {
+		select {
+		case <-sig:
+			if err := logs.reopen(); err != nil {
+				logf("log reopen failed: %s", err)
+			} else {
+				logf("log file reopened")
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }

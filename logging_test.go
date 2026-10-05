@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/syslog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -191,5 +193,164 @@ func TestLogReopen(t *testing.T) {
 	fresh, err = os.ReadFile(path)
 	if err != nil || !strings.Contains(string(fresh), "after failed reopen") {
 		t.Fatalf("failed reopen lost the current descriptor: %q", fresh)
+	}
+
+	// A symlinked replacement is refused; the current descriptor keeps serving.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "outside.log"), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := logs.reopen(); err == nil {
+		t.Fatal("reopened through a symlink")
+	}
+	logs.logger.Print("after a symlinked replacement")
+	if _, err := os.Stat(filepath.Join(dir, "outside.log")); !os.IsNotExist(err) {
+		t.Fatal("wrote through the symlink")
+	}
+}
+
+func TestRotationHandler(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.log")
+	logs, err := openServerLog(options{logFile: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// serve() registers SIGUSR1 on this channel; the handler itself only reads it.
+	sig := make(chan os.Signal, 1)
+	handler := make(chan struct{})
+	go func() {
+		defer close(handler)
+		rotationHandler(ctx, sig, logs, logs.logger.Printf)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-handler
+	})
+
+	// A permissive replacement is refused, and the report goes to the current file.
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	sig <- syscall.SIGUSR1
+	if err := waitForLogRecord(path, "log reopen failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	sig <- syscall.SIGUSR1
+	if err := waitForLogRecord(path, "log file reopened"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The handler stops before the log closes, so a signal in flight cannot swap
+	// or write to a closed descriptor.
+	cancel()
+	<-handler
+	logs.Close()
+	if err := logs.reopen(); err == nil {
+		t.Fatal("reopened a closed log")
+	}
+}
+
+func TestLogReopenConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.log")
+	logs, err := openServerLog(options{logFile: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
+
+	const records = 200
+	const midpoint = records / 2
+	rotated := filepath.Join(dir, "server.log.1")
+	step := make(chan int)             // the writer announces every completed record
+	rotatedOver := make(chan struct{}) // the swap is finished
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		for i := 0; i < records; i++ {
+			logs.logger.Printf("record %d", i)
+			step <- i
+			if i == midpoint {
+				// The next record must wait for the swap, so the split point is exact.
+				<-rotatedOver
+			}
+		}
+	}()
+
+	for i := 0; i < records; i++ {
+		if <-step == midpoint {
+			if err := os.Rename(path, rotated); err != nil {
+				t.Fatal(err)
+			}
+			if err := logs.reopen(); err != nil {
+				t.Fatal(err)
+			}
+			close(rotatedOver)
+		}
+	}
+	<-written
+
+	numbers := func(b []byte) []int {
+		var ns []int
+		for _, line := range strings.Split(string(b), "\n") {
+			if line == "" {
+				continue
+			}
+			i := strings.Index(line, "record ")
+			if i < 0 {
+				t.Fatalf("partial record: %q", line)
+			}
+			n, err := strconv.Atoi(line[i+len("record "):])
+			if err != nil {
+				t.Fatalf("partial record: %q", line)
+			}
+			ns = append(ns, n)
+		}
+		return ns
+	}
+
+	before, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedRecords, freshRecords := numbers(before), numbers(after)
+	if len(rotatedRecords)+len(freshRecords) != records {
+		t.Fatalf("records lost or duplicated: %d + %d", len(rotatedRecords), len(freshRecords))
+	}
+	// Every record is written entirely to one file, so the split is a prefix of
+	// the record sequence.
+	for i, n := range append(rotatedRecords, freshRecords...) {
+		if n != i {
+			t.Fatalf("records interleaved across files: %v + %v", rotatedRecords, freshRecords)
+		}
+	}
+	if len(rotatedRecords) != midpoint+1 || len(freshRecords) != records-midpoint-1 {
+		t.Fatalf("reopen did not split records at the midpoint: %v + %v", rotatedRecords, freshRecords)
+	}
+}
+
+func waitForLogRecord(path, want string) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no %q in %s", want, path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
