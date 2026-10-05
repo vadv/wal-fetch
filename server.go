@@ -190,13 +190,7 @@ func serve(o options) (serveErr error) {
 	if err != nil {
 		return err
 	}
-	// A rotation signal in flight must finish before the log closes, so no
-	// record is written to or swapped onto a closed descriptor.
-	rotation := make(chan struct{})
-	defer func() {
-		<-rotation
-		logs.Close()
-	}()
+	defer logs.Close()
 	var lock *os.File
 	if os.Getenv("WAL_FETCH_INHERITED_LOCK") == "1" {
 		lock = os.NewFile(3, "server.lock")
@@ -251,16 +245,20 @@ func serve(o options) (serveErr error) {
 	s := source{o: o, logger: logs.logger}
 	defer s.close()
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
 	go func() { <-ctx.Done(); listener.Close() }()
 	// Log rotation is external: after renaming the file, the post-rotate hook
 	// signals the PID in server.pid.
 	rotate := make(chan os.Signal, 1)
 	signal.Notify(rotate, syscall.SIGUSR1)
 	defer signal.Stop(rotate)
+	rotation := make(chan struct{})
 	go func() {
 		defer close(rotation)
 		rotationHandler(ctx, rotate, logs, s.logf)
+	}()
+	defer func() {
+		cancel()
+		<-rotation
 	}()
 	s.logf("server started")
 	defer s.logf("server stopped")

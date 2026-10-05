@@ -148,7 +148,7 @@ All server state is in `<pgdata>/.wal-fetch`, created with mode `0700` and owned
 - The lock and log files are opened with `O_NOFOLLOW` and must be regular files owned by the same UID with mode `0600`. The socket directory must be owned by that UID with mode `0700`.
 - The socket carries filenames, digests and file bytes only; connection settings appear only inside the identity digest.
 - The destination appears by `rename` after `fsync`, so PostgreSQL never sees a partial segment or history file. A failed request leaves the destination unchanged.
-- Multi-host connection strings are rejected. The server pins the first system identifier and timeline it sees and stops on any change.
+- Multi-host connection strings are rejected. The running server pins the source system identifier and rejects a different cluster. A timeline change within the same cluster restarts the server.
 - Leftover staging files are removed at startup by the lock owner; nothing from a previous run is reused.
 
 ## Troubleshooting
@@ -159,7 +159,8 @@ Client errors go to stderr with the `wal-fetch:` prefix. Server-side rejections 
 |---|---|---|
 | `source configuration mismatch` | Client settings differ from the running server's | Restart the server, then retry |
 | `socket peer UID mismatch` | Socket peer runs as another OS user | One OS user owns `$PGDATA`; check who started the other server |
-| `source system or timeline changed; start a new server` | The primary was reinitialized or moved to a new timeline | The server stops itself; the next request starts a new one |
+| `source system identifier changed` | The source address now belongs to a different cluster | Check the source address; the failed request allows archive fallback |
+| `source system or timeline changed; start a new server` | The same cluster moved to a new timeline | The server restarts automatically |
 | `server startup failed` | The freshly started server failed | Read `server.log` |
 | `PGDATA path is too long for Unix socket` | Path over the 108-character Unix-socket limit | Use a shorter PGDATA |
 | `server already running` | Foreground `-serve` while another server owns the lock | Use the running server, or stop it first |
@@ -174,7 +175,7 @@ WHERE slot_name LIKE 'wal_fetch_%';
 
 ## Limits
 
-Linux only. The server follows one fixed primary and timeline; a change stops it and the next request starts a new one against the new source. Losing its connection also loses the slot's retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
+Linux only. Losing the server connection also loses the slot's retention. An active segment is a snapshot of flushed WAL with a zero-filled tail.
 
 Syslog needs a local receiver at startup. Delivery is best effort: a stalled receiver can lose syslog copies, file logging continues.
 
@@ -191,6 +192,8 @@ python -m pip install -r tests/integration/requirements.txt
 python -m pytest tests/integration -v
 WAL_FETCH_TEST_SEGMENT_MB=1 python -m pytest tests/integration -v
 ```
+
+With PostgreSQL 18 tools on `PATH`, set `WAL_FETCH_TEST_PG_VERSION=18` when running pytest.
 
 Release builds set the version reported by `-version`:
 

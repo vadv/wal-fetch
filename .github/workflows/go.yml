@@ -75,6 +75,8 @@ jobs:
   race:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      GORACE: log_path=${{ github.workspace }}/diagnostics/race/report
     defaults:
       run:
         shell: bash
@@ -98,7 +100,9 @@ jobs:
           echo "$GITHUB_WORKSPACE/tests/integration/.venv/bin" >> "$GITHUB_PATH"
       - name: Build race-enabled binary
         id: build
-        run: CGO_ENABLED=1 go build -race -trimpath -o wal-fetch . 2>&1 | tee diagnostics/build.log
+        run: |
+          mkdir -p diagnostics/race
+          CGO_ENABLED=1 go build -race -trimpath -o wal-fetch . 2>&1 | tee diagnostics/build.log
       - name: PostgreSQL recovery with race-enabled binary
         id: pytest
         env:
@@ -116,6 +120,14 @@ jobs:
           WAL_FETCH_TEST_WORK: /tmp
           WAL_FETCH_TEST_EVIDENCE: ${{ github.workspace }}/diagnostics/recovery
         run: python -m pytest tests/integration -v 2>&1 | tee diagnostics/integration-race-no-slot.log
+      - name: Check race reports from all processes
+        if: always()
+        run: |
+          if compgen -G 'diagnostics/race/report.*' > /dev/null; then
+            echo '::error::Go race detector reported a data race'
+            cat diagnostics/race/report.*
+            exit 1
+          fi
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4

@@ -24,8 +24,9 @@ type coverage struct {
 // The wording is part of the protocol contract.
 const codeSourceChanged = "source system or timeline changed; start a new server"
 
-// errSourceChanged is fatal: the server follows one fixed source identity.
+// Only a timeline change may restart the server and retry the request.
 var errSourceChanged = errors.New(codeSourceChanged)
+var errSystemIDChanged = errors.New("source system identifier changed")
 
 // Only overlapping/adjacent published coverage advances retention; forget jumps.
 func (p coverage) published(tli uint32, start, end pglogrepl.LSN) coverage {
@@ -111,6 +112,9 @@ func (s *source) connect(ctx context.Context) (*pgconn.PgConn, error) {
 	}
 	if s.systemID != "" && (s.systemID != id.SystemID || s.timeline != uint32(id.Timeline)) {
 		_ = conn.Close(ctx)
+		if s.systemID != id.SystemID {
+			return nil, errSystemIDChanged
+		}
 		return nil, errSourceChanged
 	}
 	if s.systemID == "" {
@@ -181,6 +185,9 @@ func (s *source) fetch(ctx context.Context, req request, f *os.File) (candidate 
 	}
 	if id.SystemID != s.systemID || uint32(id.Timeline) != s.timeline {
 		s.lost()
+		if id.SystemID != s.systemID {
+			return candidate, errSystemIDChanged
+		}
 		return candidate, errSourceChanged
 	}
 	var history []byte
