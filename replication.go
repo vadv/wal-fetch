@@ -20,9 +20,8 @@ type coverage struct {
 	tli        uint32
 }
 
-// codeSourceChanged is the wire code the client recognizes as "stop talking to
-// this server and start a replacement". It is part of the protocol contract, so
-// the wording must not change; the client compares it against the error field.
+// codeSourceChanged is the wire code the client recognizes as "start a new server".
+// The wording is part of the protocol contract.
 const codeSourceChanged = "source system or timeline changed; start a new server"
 
 // errSourceChanged is fatal: the server follows one fixed source identity.

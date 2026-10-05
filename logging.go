@@ -24,7 +24,7 @@ type serverLog struct {
 	syslog *syslog.Writer
 	logger *log.Logger
 	queue  chan string
-	done   chan struct{} // Worker completion is observable; Close never waits for it.
+	done   chan struct{} // Closed when the worker exits.
 }
 
 func openLogFile(path string) (*os.File, error) {
@@ -103,7 +103,7 @@ func openServerLog(o options) (*serverLog, error) {
 }
 
 func (l *serverLog) Write(b []byte) (int, error) {
-	// File writes stay synchronous. A slow syslog drops queued copies, never blocks WAL.
+	// File writes are synchronous; a slow syslog drops queued copies and never blocks WAL delivery.
 	l.mu.Lock()
 	if !l.closed {
 		_, _ = l.file.Write(b)
@@ -111,17 +111,15 @@ func (l *serverLog) Write(b []byte) (int, error) {
 	l.mu.Unlock()
 	if l.queue != nil {
 		select {
-		case l.queue <- string(b): // Copy the logger's reusable buffer.
+		case l.queue <- string(b):
 		default:
 		}
 	}
 	return len(b), nil
 }
 
-// reopen swaps the file descriptor after an external rotation. A record is
-// written entirely to one file; the old descriptor stays in use when opening
-// the replacement fails. Reopening a closed log does nothing: Close is the end
-// of the descriptor's lifetime.
+// reopen swaps the descriptor after an external rotation. A record is written
+// entirely to one file, and a failed reopen keeps the current descriptor.
 func (l *serverLog) reopen() error {
 	f, err := openLogFile(l.path)
 	if err != nil {
@@ -140,8 +138,7 @@ func (l *serverLog) reopen() error {
 }
 
 func (l *serverLog) Close() {
-	// Never wait for syslog's mutex. The rotation handler is stopped before
-	// Close, and the mutex still covers a reopen that was already in flight.
+	// Close never waits for a syslog write, which can block indefinitely on a stalled receiver.
 	if l.queue != nil {
 		close(l.queue)
 	}

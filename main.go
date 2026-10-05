@@ -22,8 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// buildVersion can be set at build time with -ldflags "-X main.buildVersion=...".
-// A build from source reports "dev" so it is never mistaken for a release.
+// Set at build time with -X main.buildVersion.
 var buildVersion = "dev"
 
 type options struct {

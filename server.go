@@ -296,10 +296,7 @@ func serve(o options) (serveErr error) {
 	}
 }
 
-// rotationHandler reopens the log on every signal until ctx is done. Log rotation
-// is external: after renaming the file, the post-rotate hook signals the PID in
-// server.pid. The handler returns when ctx is cancelled, which happens before the
-// log is closed.
+// rotationHandler reopens the log on every signal until ctx is done.
 func rotationHandler(ctx context.Context, sig <-chan os.Signal, logs *serverLog, logf func(format string, args ...any)) {
 	for {
 		select {
