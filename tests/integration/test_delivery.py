@@ -39,14 +39,14 @@ def test_quiet_active_wal(fx, source):
     offset = lsn(quiet_flush) % int(quiet_size)
     assert offset > 0 and len(got) == len(raw) == int(quiet_size)
     assert got[:offset] == raw[:offset]
-    # The source may append WAL between the quiet_flush snapshot and the
-    # server's read, so the tail is checked per byte instead of requiring
-    # an all-zero suffix: each byte is either the zero the server pads
-    # beyond its cut point or the immutable WAL byte at that position.
-    tail, raw_tail = got[offset:], raw[offset:]
-    assert all(b == 0 or b == r for b, r in zip(tail, raw_tail)), \
-        (quiet_flush, after, next(i for i, (b, r) in enumerate(zip(tail, raw_tail)) if b != 0 and b != r))
-    fx.result['quiet_active_prefix_and_immutable_tail'] = True
+    # The delivered file is a prefix of the segment as the source had it, padded
+    # with zeros beyond the point the server read. WAL bytes already written are
+    # immutable, so the first mismatch is the server's cut point: it may be later
+    # than quiet_flush because the source kept generating WAL during the fetch.
+    cut = next((i for i in range(offset, len(got)) if got[i] != raw[i]), len(got))
+    assert all(b == 0 for b in got[cut:]), (quiet_flush, after, cut)
+    fx.result['quiet_active_prefix_and_zero_tail'] = True
+    fx.result['quiet_active_cut_offset'] = cut
 
 
 def test_credentials_and_errors(fx, source, closed, session):
